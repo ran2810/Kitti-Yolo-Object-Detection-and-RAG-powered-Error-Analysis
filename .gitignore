@@ -4,3 +4,6 @@
 **/training/**/*.txt
 **/training/**/*.png
 **/jupyter/**/*.zip
+*.xlsx
+runs/detect/predict/kitti_labels/*
+runs/detect/predict/labels/*

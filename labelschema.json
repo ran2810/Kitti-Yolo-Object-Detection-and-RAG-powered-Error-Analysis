@@ -1,0 +1,11 @@
+{
+  "id": "000123",
+  "image_path": "...",
+  "label_path": "...",
+  "objects": [...],
+  "error_stats": {...},
+  "summary_text": "Frame 123 contains 3 cars...",
+  "num_cars": 3,
+  "num_pedestrians": 1,
+  "max_occlusion": 2
+}
