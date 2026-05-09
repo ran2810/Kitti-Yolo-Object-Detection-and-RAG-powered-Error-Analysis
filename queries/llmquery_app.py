@@ -15,7 +15,7 @@ def load_fuzzy_rules():
     """
     # load json for fuzzy rules
     """
-    with open("data/fuzzy_rules.json", "r") as f:
+    with open("../data/fuzzy_rules.json", "r") as f:
         return json.load(f)
 
 FUZZY_RULES = load_fuzzy_rules()
@@ -197,17 +197,17 @@ def load_rag():
     load RAG components (labels file doc, faiss index, transformer embedded model)
     """
     # load for the input dataset
-    with open("data/kitti_docs.json", "r") as f:
+    with open("../data/kitti_docs.json", "r") as f:
         scene_docs = json.load(f)
-    scene_index = faiss.read_index("data/kitti_index.faiss")
+    scene_index = faiss.read_index("../data/kitti_index.faiss")
 
     # load the prediction errors
-    with open("data/error_docs.json", "r") as f:
+    with open("../data/error_docs.json", "r") as f:
         error_docs = json.load(f)
-    error_index = faiss.read_index("data/error_index.faiss")
+    error_index = faiss.read_index("../data/error_index.faiss")
 
     # load model name
-    with open("data/embedding_model.txt", "r") as f:
+    with open("../data/embedding_model.txt", "r") as f:
         model_name = f.read().strip()
 
     model = SentenceTransformer(model_name)
@@ -313,13 +313,14 @@ def render_side_by_side(frame_id, image_path, frame_errors):
     :param image_path: Description
     :param frame_errors: Description
     """
+
     img = cv2.imread(image_path)
     if img is None:
         return None
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    gt_path = os.path.join("data/training/label_2", f"{frame_id}.txt")
-    pred_path = os.path.join("runs/detect/predict/kitti_labels", f"{frame_id}.txt")
+    gt_path = os.path.join("../data/training/label_2", f"{frame_id}.txt")
+    pred_path = os.path.join("../runs/detect/predict/kitti_labels", f"{frame_id}.txt")
 
     gt_objs = parse_kitti_label_file(gt_path)
     pred_objs = parse_kitti_label_file(pred_path)
@@ -423,20 +424,23 @@ if query:
         for d in filtered_docs[:top_k]:
             st.subheader(f"Frame {d['id']}")
             st.write(d["summary_text"])
-
+            current_dir = os.path.dirname(__file__)
+            parent_dir  = os.path.dirname(current_dir)
+            img_path = os.path.normpath(os.path.join(parent_dir, d["image_path"]))
             if query_mode == "Error Analysis":
                 st.write(f"**Error Type:** {d['error_type']}")
                 st.write(f"**Class:** {d['class']}")
                 st.write(f"**IoU:** {d['iou']}")
 
                 frame_errors = [e for e in error_docs if e["id"] == d["id"]]
-                combined = render_side_by_side(d["id"], d["image_path"], frame_errors)
+
+                combined = render_side_by_side(d["id"], img_path, frame_errors)
                 if combined is not None:
                     st.image(combined, caption="GT (left) vs Predictions (right)")
                 else:
-                    st.image(d["image_path"])
+                    st.image(img_path)
             else:
-                st.image(d["image_path"])
+                st.image(img_path)
         st.stop()
 
     if filters:
@@ -452,17 +456,21 @@ if query:
     for d in results:
         st.subheader(f"Frame {d['id']}")
         st.write(d["summary_text"])
-
+        current_dir = os.path.dirname(__file__)
+        parent_dir  = os.path.dirname(current_dir)
+        img_path = os.path.normpath(os.path.join(parent_dir, d["image_path"]))
+        
         if query_mode == "Error Analysis":
             st.write(f"**Error Type:** {d['error_type']}")
             st.write(f"**Class:** {d['class']}")
             st.write(f"**IoU:** {d['iou']}")
             frame_errors = [e for e in error_docs if e["id"] == d["id"]]
-            combined = render_side_by_side(d["id"], d["image_path"], frame_errors)
+
+            combined = render_side_by_side(d["id"], img_path, frame_errors)
             if combined is not None:
                 st.image(combined, caption="GT (left) vs Predictions (right)")
             else:
-                st.image(d["image_path"])
+                st.image(img_path)
 
-        st.image(d["image_path"])
+        st.image(img_path)
 
