@@ -22,17 +22,17 @@ The entire workflow is orchestrated through a Colab notebook for reproducibility
 
 ## Repository Structure
 
-'-- download_kittidataset.py\
-'-- label_convertor.py\
-'-- evaluate_yolo.py\
-'-- benchmark_model.py\
-'-- visualize_predictions.py\
-'-- generate_faiss_doc.py\
+'-- preprocessing/download_kittidataset.py\
+'-- preprocessing/label_convertor.py\
+'-- model/evaluate_yolo.py\
+'-- model/benchmark_model.py\
+'-- utils/visualize_predictions.py\
+'-- queries/generate_faiss_doc.py\
 '-- queries/llmquery_app.py\
-'-- **queries/llm_langchain_query.py\**
+'-- **queries/llm_langchain_query.py**\
 '-- data/  <-- generated files & label format.txt\
 '-- google_collab_trigger_training.ipynb\
-'-- kitti.yaml\
+'-- data/kitti.yaml\
 '-- architecture/ <-- architecture diagram of the project\
 '-- screenshots/ <-- Screenshots of the Streamlit UI\
 '-- README.md
