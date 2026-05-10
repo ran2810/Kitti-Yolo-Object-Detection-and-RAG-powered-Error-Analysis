@@ -361,7 +361,7 @@ def plot_results(results):
 # ------------------------------------------------------------
 # MASTER FUNCTION
 # ------------------------------------------------------------
-def trigger_all_benchmarks(model_path="best.pt", data_yaml="kitti.yaml"):
+def trigger_all_benchmarks(model_path="best.pt", data_yaml="../data/kitti.yaml"):
 
     results = {}
 
@@ -399,4 +399,4 @@ def trigger_all_benchmarks(model_path="best.pt", data_yaml="kitti.yaml"):
 # Run directly from CLI
 # ------------------------------------------------------------
 if __name__ == "__main__":
-    trigger_all_benchmarks("best.pt", "kitti.yaml")
+    trigger_all_benchmarks("best.pt", "../data/kitti.yaml")

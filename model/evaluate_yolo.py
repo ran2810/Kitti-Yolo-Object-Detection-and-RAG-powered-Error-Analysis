@@ -1,6 +1,6 @@
 from ultralytics import YOLO
 
-def evaluate(model_path="runs/detect/train/weights/best.pt", data="kitti.yaml"):
+def evaluate(model_path="../runs/detect/train/weights/best.pt", data="../data/kitti.yaml"):
     model = YOLO(model_path)
     metrics = model.val(data=data)
 

@@ -140,9 +140,13 @@ if __name__ == "__main__":
     parser.add_argument('convert_typ', type=str,
                         help='yolo2kitti or kitti2yolo')
     args = parser.parse_args()
+    current_dir = os.path.dirname(__file__)
+    parent_dir  = os.path.dirname(current_dir)
 
+    kitti_root = os.path.join(parent_dir, "data/training")
+    out_root  = os.path.join(parent_dir, "kitti_yolo")
     if args.convert_typ == "kitti2yolo":
-        prepare_yolo_dataset()
+        prepare_yolo_dataset(kitti_root, out_root)
     
     if args.convert_typ == "yolo2kitti":
         batch_convert_yolo2kitti()

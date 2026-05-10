@@ -243,23 +243,23 @@ def build_kitti_index(label_dir, image_dir, pred_dir):
 # CLI ENTRY POINT
 # ------------------------------------------------------------
 if __name__ == "__main__":
-    label_dir = "data/training/label_2"
-    image_dir = "data/training/image_2"
-    pred_dir = "runs/detect/predict/kitti_labels"
+    label_dir = "../data/training/label_2"
+    image_dir = "../data/training/image_2"
+    pred_dir = "../runs/detect/predict/kitti_labels"
 
     scene_docs, scene_index, error_docs, error_index, model = build_kitti_index(label_dir, image_dir, pred_dir)
 
     # Save scene docs
     with open("data/kitti_docs.json", "w") as f:
         json.dump(scene_docs, f, indent=2)
-    faiss.write_index(scene_index, "data/kitti_index.faiss")
+    faiss.write_index(scene_index, "../data/kitti_index.faiss")
 
     # Save error docs
-    with open("data/error_docs.json", "w") as f:
+    with open("../data/error_docs.json", "w") as f:
         json.dump(error_docs, f, indent=2)
     if error_index:
-        faiss.write_index(error_index, "data/error_index.faiss")
+        faiss.write_index(error_index, "../data/error_index.faiss")
 
     # Save embedding model name
-    with open("data/embedding_model.txt", "w") as f:
+    with open("../data/embedding_model.txt", "w") as f:
         f.write("all-MiniLM-L6-v2")
