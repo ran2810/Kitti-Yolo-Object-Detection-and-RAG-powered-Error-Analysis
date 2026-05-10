@@ -9,9 +9,10 @@ This repository provides a complete, modular pipeline for training YOLO models o
 - Train/val split  
 - Model training on Google Colab GPU  
 - Evaluation (mAP50 & mAP50-95) 
-- Model benchmarking across FP32, FP32-GPU, FP16, and INT8
+- Model benchmarking across FP32, FP32-GPU, FP16, and INT8 over CPU, GPU (PyTorch) and GPU (TensorRT)
 - FAISS vector index and document store used by the RAG‑powered query application
 - RAG‑Powered LLM Query Engine (Llama3 + FAISS)
+- **RAG‑Powered LLM Query with LCEL Engine (Llama3/Groq + FAISS)**
 - Visualization of predictions vs. ground truth  
 - Sample video inference results  
 
@@ -27,10 +28,13 @@ The entire workflow is orchestrated through a Colab notebook for reproducibility
 '-- benchmark_model.py\
 '-- visualize_predictions.py\
 '-- generate_faiss_doc.py\
-'-- llmquery_app.py\
+'-- queries/llmquery_app.py\
+'-- **queries/llm_langchain_query.py\**
 '-- data/  <-- generated files & label format.txt\
 '-- google_collab_trigger_training.ipynb\
 '-- kitti.yaml\
+'-- architecture/ <-- architecture diagram of the project\
+'-- screenshots/ <-- Screenshots of the Streamlit UI\
 '-- README.md
 
 ## Requirements
@@ -63,6 +67,10 @@ Or install manually:
 - onnx 
 - onnxruntime-gpu 
 - pycuda
+- langchain 
+- langchain-core 
+- langchain-groq
+- langchain-ollama
 
 Additionally, need TensorRT and trtexec system packages
 
@@ -388,6 +396,102 @@ Display matching KITTI frames or side by side depending on query mode
 “IoU < 0.4 errors for cars”\
 “FN for truncation > 0.5”
 
+### 7: `llm_langchain_query.py`
+
+A production-grade Streamlit application that queries the KITTI dataset using natural language across automatic detection modes: Scene Search and Error Analysis. Built with **LangChain LCEL (LangChain Expression Language)** and a switchable LLM backend (local Ollama or Groq cloud).
+
+
+#### Architecture — LangChain LCEL Pipeline
+
+The query engine is a composable **LCEL chain** using the `|` operator, replacing the deprecated `AgentExecutor` / `LLMChain` APIs:
+
+```
+{query, mode}
+    │
+    ▼  RunnableLambda — interpret_step
+    │  LLM (ChatOllama or ChatGroq) converts NL → structured JSON filters
+    │  Auto-detects Scene Search vs Error Analysis mode
+    │  Fuzzy-matched queries skip the LLM entirely (fast path)
+    │
+    ▼  RunnableLambda — filter_step
+    │  Exact numeric scan over scene_docs (7 481) or error_docs (22 417)
+    │  Operators: >, >=, <, <=, ==   with automatic type coercion
+    │
+    ▼  RunnableBranch — routing
+    ├─ filter found results → filter_hit_step  (semantic skipped)
+    └─ filter empty        → semantic_step     (FAISS ANN, top-10)
+    │
+    ▼  RunnableLambda — merge_step
+       Assembles display_docs + per-step latency_ms dict → Streamlit UI
+```
+
+#### Latency Optimisations
+
+1. **Fuzzy-only fast path** — queries whose every term is fully covered by `fuzzy_rules.json` skip the LLM entirely (~5 ms). Applies to: `"few cyclists and rare pedestrians"`, `"crowded and heavy occlusion"`, `"busy intersection with few cyclists"`, `"crowded and busy with rare cyclists"`. The debug panel shows `fuzzy rules only — LLM skipped`.
+
+2. **Compact prompt** (~80 tokens vs ~300 previously) — fewer tokens = lower time-to-first-token on both Ollama and Groq.
+
+3. **Fuzzy rule authority** — after the LLM produces filters, any field covered by a fuzzy rule is overwritten with the rule's exact value, preventing the LLM from guessing `<=2` when the rule defines `<=1`.
+
+4. **Session-state caching** — the pipeline only re-runs when query, mode, provider, or model changes. Widget interactions (pagination, expanders) never re-trigger inference.
+
+---
+
+#### Pipeline Debug Panel
+
+Every query exposes a collapsible **Pipeline debug** expander:
+
+- **Mode used** — with an `overridden` badge if auto-detection changed the UI hint
+- **Step 1 output** — parsed `filters` + `semantic_query` JSON; source label `fuzzy rules only` or `LLM inference`
+- **Step 2** — docs scanned, matches found, field type/value in docs (for diagnosing filter mismatches)
+- **Step 3** — `skipped (filter had results)` or count of semantic results
+- **Latency table** — per-step ms breakdown with percentage share and provider badge
+
+#### Scene Search (latency in ms)
+
+| Query                                             | Ollama | Groq (llama‑3.1‑8b‑instant)  |
+|---------------------------------------------------|--------|------------------------------|
+| "more than 5 pedestrians"                         | 30478  | 163                          |
+| "busy intersection with few cyclists"(fuzz words) | 0      | 0                            |
+| "heavy occlusion and more than 2 cars"            | 12039  | 209                          |
+| "atleast 2 cars and more than 3 pedestrians"      | 11243  | 207                          |
+| "few cyclists and rare pedestrians"               | 11609  | 192                          |
+
+
+#### Error Anaylsis (latency in ms)
+
+| Query                                      | Ollama | Groq (llama‑3.1‑8b‑instant)   |
+|--------------------------------------------|--------|-------------------------------|
+| “false positives for cyclists” (detected)  | 20219  | 216                           |
+| “missed pedestrians with occlusion 3”      | 10831  | 246                           |
+| “IoU < 0.4 errors for cars”                | 10214  | 161                           |
+| “FN for truncation > 0.5”                  | 12506  | 225                           |
+
+#### Running the App
+
+**Option A — Ollama (local, recommended for privacy)**
+
+```bash
+# Terminal 1 — start the local LLM server
+ollama run llama3          # first run downloads the model (~4 GB)
+                           # alternatives: ollama pull llama3.1 / qwen2.5:14b
+
+# Terminal 2 — install and launch
+streamlit run llmquery_app.py
+```
+
+**Option B — Groq (cloud, recommended for speed)**
+
+```bash
+# Get a free API key at: https://console.groq.com
+streamlit run llmquery_app.py
+# Paste your Groq key in the sidebar -> select llama-3.3-70b-versatile
+```
+
+The app automatically loads the FAISS index, SentenceTransformer embeddings, and fuzzy rules on startup.
+
+---
+
 ## Training Workflow (Google Colab)
 
 All scripts are orchestrated inside:
@@ -467,5 +571,6 @@ Scripts will run, but full training is slow without a GPU.
 - Benchmarking module provides deeper insight into deployment performance  
 - builds the FAISS vector index,  document store for GT & Error document generation (FP/FN/IoU/occ/trunc)
 - Streamlit application lets you RAG‑powered LLM query engine for KITTI dataset using natural language
+- **Streamlit application lets you RAG‑powered LLM query with LCEL engine for KITTI dataset using natural language with automatic mode selection and model switch (llama vs groq)**
 - Query engine for error analysis shows Side‑by‑side GT vs prediction visualization
 - Future work will focus on TensorRT and OpenVINO acceleration   
