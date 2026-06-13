@@ -218,6 +218,7 @@ def build_kitti_index(label_dir, image_dir, pred_dir):
         convert_to_numpy=True
     )
 
+    # dimension (384 based on model used above). good for the N < 100k. fast and 100% recall
     scene_index = faiss.IndexFlatL2(scene_embeddings.shape[1])
     scene_index.add(scene_embeddings)
 

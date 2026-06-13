@@ -1,72 +1,27 @@
 # =============================================================================
 # KITTI RAG Explorer
-# LangChain LCEL Pipeline · Switchable LLM Backend (Ollama local / Groq cloud)
+# LangChain LCEL Pipeline with switchable LLM Backend (Ollama local / Groq cloud)
 #
-# ── What this app does ───────────────────────────────────────────────────────
+#  What this app does 
 # Natural-language search over a KITTI autonomous-driving dataset.
 # Supports two query modes:
 #   • Scene Search   — find frames by object counts / occlusion levels
 #   • Error Analysis — find detection errors (FP/FN) by class, IoU, occlusion
 #
-# ── LangChain LCEL pipeline ──────────────────────────────────────────────────
+#  LangChain LCEL pipeline 
 # Each processing step is a RunnableLambda composed with the LCEL | operator
 # into a single inspectable chain.  LangChain orchestrates the data flow;
 # the LLM is used only for natural-language -> JSON filter interpretation.
 #
-#   User query (natural language)
-#       ↓  RunnableLambda
-#   interpret_step    — LLM (ChatOllama or ChatGroq) converts NL -> JSON filters
-#       ↓              Fuzzy-matched queries skip the LLM entirely (fast path)
-#   filter_step       — exact numeric scan over kitti_docs / error_docs
-#       ↓  RunnableBranch
-#   semantic_branch   — FAISS ANN search (only when filter finds 0 results)
-#       ↓  RunnableLambda
-#   merge_step        — assembles display_docs + per-step latency_ms
-#       ↓
-#   Streamlit UI      — paginated results, bounding-box visualisation
-#
-# ── Model selection ──────────────────────────────────────────────────────────
-# The sidebar lets you switch between two backends at runtime:
+#  Model selection 
+# Use sidebar for switching between two backends at runtime:
 #
 #   Ollama (local) — private, no API key, ~2–5 s/query
 #     Models: llama3
-#     Pull a model: `ollama pull <model>`
 #
 #   Groq (cloud)  — free API key at console.groq.com, ~0.3–0.8 s/query
 #     Models: llama-3.3-70b-versatile (default), llama-3.1-8b-instant
 #
-# Both backends implement LangChain's ChatModel interface (ChatOllama /
-# ChatGroq), so the LCEL chain is provider-agnostic — swapping models
-# requires zero code changes, only a sidebar selection.
-#
-# ── Why LCEL instead of a ReAct agent ───────────────────────────────────────
-# The original design used LangChain AgentExecutor + create_react_agent.
-# llama3 8B (and most sub-70B models) cannot reliably follow the ReAct
-# Thought -> Action -> Observation loop: they write tool JSON inline and
-# emit "Action: None", breaking the agent loop.  This is a model capability
-# issue, not a LangChain issue.
-#
-# LCEL fixes this by giving the LLM a single, well-scoped task (NL -> JSON)
-# and handling all orchestration deterministically in Python.  The three
-# @tool-decorated functions (_interpret_query_impl, _filter_docs_impl,
-# _semantic_search_impl) remain agent-compatible — to restore full ReAct
-# tool-calling, swap in a function-calling model:
-#   Local : ollama pull llama3.1:70b  or  ollama pull qwen2.5:14b
-#   Groq  : llama-3.3-70b-versatile (default, free tier)
-#           Note: llama-3.1-70b-versatile decommissioned Jan 2025
-#   Cloud : ChatOpenAI(model='gpt-4o') — add OPENAI_API_KEY to .env
-# Then re-enable AgentExecutor with the same three @tool functions.
-#
-# ── LangChain components used ────────────────────────────────────────────────
-#   @tool                — marks impl functions as reusable agent tools
-#   RunnableLambda       — wraps Python functions as LCEL Runnables
-#   RunnableBranch       — conditional routing (filter hit vs semantic fallback)
-#   ChatOllama           — LangChain wrapper for local Ollama models
-#   ChatGroq             — LangChain wrapper for Groq cloud API
-#   SystemMessage /
-#   HumanMessage         — pre-built message objects (avoids template conflicts)
-#   @st.cache_resource   — caches compiled chain per (provider, model) pair
-#   LCEL | operator      — composes steps into a readable, traceable DAG
 # =============================================================================
 
 import streamlit as st
@@ -80,7 +35,7 @@ import requests
 import re
 import cv2
 
-# ── LangChain imports 
+#  LangChain imports 
 from langchain.tools import tool
 from langchain_core.runnables import (
     RunnableLambda,
@@ -100,7 +55,7 @@ warnings.filterwarnings('ignore')
 
 print_debug = True
 
-# ---------------------------------------------------------
+###########################################################
 # FUZZY RULES
 #
 # fuzzy_rules.json maps human terms ("crowded", "rare cyclists") to exact
@@ -108,7 +63,7 @@ print_debug = True
 # its own filters, any field covered by a matched fuzzy rule is overwritten
 # with the rule value.  This prevents the LLM from guessing wrong thresholds
 # (e.g. "few" -> <=2 when the rule says <=1).
-# ---------------------------------------------------------
+###########################################################
 def load_fuzzy_rules():
     with open("../data/fuzzy_rules.json", "r") as f:
         return json.load(f)
@@ -132,7 +87,7 @@ def expand_fuzzy_terms(query: str) -> list:
                 break
     return detected
 
-# ---------------------------------------------------------
+###########################################################
 # JSON SANITIZATION
 #
 # llama3 occasionally emits malformed JSON with spaces inside operator
@@ -140,7 +95,7 @@ def expand_fuzzy_terms(query: str) -> list:
 # sanitize_json() normalises these before json.loads().
 # extract_json_block() pulls the first {...} block from the raw LLM response,
 # which may contain prose before/after the JSON object.
-# ---------------------------------------------------------
+###########################################################
 def sanitize_json(text: str) -> str:
     """Fix common LLM JSON formatting errors before parsing."""
     text = re.sub(r'"\s*>=\s*"', '">="', text)
@@ -161,7 +116,8 @@ def extract_json_block(text: str) -> dict | None:
     except Exception:
         return None
 
-# ---------------------------------------------------------
+
+###########################################################
 # LCEL CHAIN — LLM QUERY INTERPRETER
 #
 # _interpret_query_impl() is the only place in the pipeline where the LLM
@@ -170,28 +126,10 @@ def extract_json_block(text: str) -> dict | None:
 #   "filters"       — field/operator/value conditions for exact numeric search
 #   "semantic_query"— reworded query text for FAISS vector search fallback
 #
-# Provider switching (Ollama <-> Groq) is handled here:
-#   • A LangChain ChatModel instance (ChatOllama or ChatGroq) is passed in
-#     as the `llm` argument from build_pipeline() / interpret_step().
-#   • llm.invoke(messages) replaces the old requests.post() call, so the
-#     active backend is always whatever the sidebar selected.
-#   • Both ChatOllama and ChatGroq implement the same ChatModel interface —
-#     the function body is completely provider-agnostic.
-#
-# Latency optimisations:
-#   1. Fuzzy-only fast path — if every query term is covered by fuzzy_rules.json
-#      the LLM is skipped entirely and filters come straight from the rules.
-#      Example: "few cyclists and rare pedestrians" -> 0 ms (no inference).
-#   2. Compact prompt (~80 tokens) — field lists and examples are stripped;
-#      only the essential instruction + fuzzy rules are sent to the model.
-#   3. SystemMessage / HumanMessage objects — passed directly to llm.invoke()
-#      without going through ChatPromptTemplate, which would fail on nested
-#      f-string expressions like {fuzzy_instructions} inside the template parser.
-#
 # @tool wrapper (interpret_query) keeps this function agent-compatible:
 #   swap in a function-calling model (llama-3.3-70b-versatile, gpt-4o) and
 #   re-enable AgentExecutor to restore full ReAct tool orchestration.
-# ---------------------------------------------------------
+###########################################################
 def _interpret_query_impl(query_and_mode: str, llm=None) -> str:
     """
     Convert natural language query into structured filters + semantic query.
@@ -397,10 +335,10 @@ def interpret_query(query_and_mode: str) -> str:
     """
     return _interpret_query_impl(query_and_mode)
 
-# ---------------------------------------------------------
+###########################################################
 # RAG CORPUS LOADING  (@st.cache_resource)
 #
-# Loads the two document corpora and their pre-built FAISS indices once at
+# Loads the two documents and their pre-built FAISS indices once at
 # startup.  @st.cache_resource ensures they stay in memory across all
 # Streamlit re-runs (widget interactions never reload from disk).
 #
@@ -411,7 +349,7 @@ def interpret_query(query_and_mode: str) -> str:
 #
 # The sentence-transformer embedding model is also loaded here so
 # _semantic_search_impl() can encode queries at search time.
-# ---------------------------------------------------------
+###########################################################
 @st.cache_resource
 def load_rag():
     with open("../data/kitti_docs.json", "r") as f:
@@ -430,19 +368,15 @@ def load_rag():
 
 scene_docs, scene_index, error_docs, error_index, emb_model = load_rag()
 
-# ---------------------------------------------------------
+###########################################################
 # LCEL CHAIN — EXACT NUMERIC FILTER
 #
-# _filter_docs_impl() scans the correct document corpus (scene_docs or
+# _filter_docs_impl() scans the correct documents (scene_docs or
 # error_docs, selected by effective_mode from Step 1) and applies the
 # structured filter conditions produced by _interpret_query_impl().
 #
 # Input format: "mode || filters_json"
 #   e.g. "Scene Search || {"num_pedestrians": {">": 5}}"
-#
-# Supported operators: >, >=, <, <=, ==, list membership.
-# Type coercion: doc field values stored as strings (e.g. "6") are
-# automatically cast to int/float to match numeric filter thresholds.
 #
 # Returns a dict:
 #   "results" — up to 50 matching docs (sorted later by the UI)
@@ -451,9 +385,7 @@ scene_docs, scene_index, error_docs, error_index, emb_model = load_rag()
 # Performance: pure Python loop, ~5–120 ms for 22 k docs.
 # No LLM involved — this step is always deterministic and fast.
 #
-# @tool wrapper (filter_docs) keeps this agent-compatible for future
-# ReAct use with a function-calling model.
-# ---------------------------------------------------------
+###########################################################
 def _filter_docs_impl(mode_and_filters: str) -> dict:
     """
     Apply numeric filters to scene or error docs.
@@ -552,7 +484,7 @@ def filter_docs(mode_and_filters: str) -> str:
     """
     return json.dumps(_filter_docs_impl(mode_and_filters))
 
-# ---------------------------------------------------------
+###########################################################
 # LCEL CHAIN — SEMANTIC VECTOR SEARCH  (fallback only)
 #
 # _semantic_search_impl() runs a FAISS approximate-nearest-neighbour search
@@ -562,17 +494,13 @@ def filter_docs(mode_and_filters: str) -> str:
 # Input format: "mode || query text"
 #   e.g. "Scene Search || busy intersection with few cyclists"
 #
-# Process:
+# Steps:
 #   1. Encode the semantic_query string with the sentence-transformer model
 #      (same model used to build the index at indexing time).
 #   2. Run index.search() for top-10 nearest neighbours by cosine similarity.
 #   3. Return the corresponding doc dicts.
 #
-# Performance: ~10–50 ms (GPU-accelerated embedding + FAISS ANN).
-# No LLM involved — purely vector arithmetic.
-#
-# @tool wrapper (semantic_search_tool) keeps this agent-compatible.
-# ---------------------------------------------------------
+###########################################################
 def _semantic_search_impl(mode_and_query: str) -> list:
     """
     Perform semantic search over KITTI scene or error docs.
@@ -604,7 +532,7 @@ def semantic_search_tool(mode_and_query: str) -> str:
     """
     return json.dumps(_semantic_search_impl(mode_and_query))
 
-# ---------------------------------------------------------
+###########################################################
 # VISUALISATION HELPERS
 #
 # parse_kitti_label_file() — reads a KITTI-format .txt label file and
@@ -619,7 +547,7 @@ def semantic_search_tool(mode_and_query: str) -> str:
 #
 # render_side_by_side() — produces the GT | Prediction composite image
 #   for one frame.  Used by render_error_doc() in Error Analysis mode.
-# ---------------------------------------------------------
+###########################################################
 def parse_kitti_label_file(path):
     if not os.path.exists(path):
         return []
@@ -683,7 +611,7 @@ def render_side_by_side(frame_id, image_path, frame_errors):
 
     return np.hstack([gt_img, pred_img])
 
-# ---------------------------------------------------------
+###########################################################
 # ERROR DOC VISUALISATION
 #
 # render_error_doc() is called for every result card in Error Analysis mode.
@@ -698,7 +626,7 @@ def render_side_by_side(frame_id, image_path, frame_errors):
 #
 # add_panel_label() — stamps a dark header bar onto each panel so the user
 #   can immediately tell GT (left) from Prediction (right) in the composite.
-# ---------------------------------------------------------
+###########################################################
 def resolve_image_path(raw_path: str):
     """Resolve a potentially relative / backslash path to an absolute path."""
     img_path = os.path.normpath(raw_path)
@@ -760,9 +688,9 @@ def render_error_doc(d: dict):
     return np.hstack([gt_panel, pred_panel]), None
 
 
-# ---------------------------------------------------------
+###########################################################
 # STREAMLIT UI + AGENT
-# ---------------------------------------------------------
+###########################################################
 st.title("KITTI RAG Explorer — LangChain LCEL + Ollama")
 
 #  LLM Provider sidebar 
@@ -826,17 +754,6 @@ query = st.text_input("Enter your query")
 # =============================================================================
 # LANGCHAIN LCEL PIPELINE — build_pipeline() / get_pipeline() / run_pipeline()
 #
-#  Design rationale 
-# LangChain Expression Language (LCEL) is the modern, composable alternative
-# to the deprecated LLMChain / AgentExecutor APIs.  Steps are defined as
-# RunnableLambda objects and composed with the | operator into a DAG that
-# LangChain can inspect, trace (LangSmith), and stream.
-#
-# The LLM is scoped to a single, well-defined task: convert a natural-language
-# query into a structured JSON filter object.  This is a short single-turn
-# completion that any model (including small local ones) handles reliably.
-# All routing, filtering, and retrieval logic is deterministic Python.
-#
 #  Model selection & provider switching 
 # build_pipeline(llm_config) accepts a config dict at runtime:
 #
@@ -850,72 +767,8 @@ query = st.text_input("Enter your query")
 #       -> Groq cloud API, free tier at console.groq.com, ~0.3–0.8 s/query
 #       -> good models: llama-3.3-70b-versatile (best quality, replaces the
 #         decommissioned llama-3.1-70b-versatile as of Jan 2025),
-#         llama-3.1-8b-instant (fastest), llama3-70b-8192, gemma2-9b-it
+#         llama-3.1-8b-instant (fastest), llama3-70b-8192, gemma2-9b-it#
 #
-# Both ChatOllama and ChatGroq implement LangChain's BaseChatModel interface,
-# so the rest of the chain — every RunnableLambda, the RunnableBranch, and
-# the merge step — is completely provider-agnostic.  Switching models is a
-# single sidebar selection; no code changes required.
-#
-# get_pipeline() is decorated with @st.cache_resource and keyed on
-# (provider, model, api_key).  The compiled chain is built once and reused
-# across Streamlit re-runs; it is only rebuilt when the user changes the
-# provider or model in the sidebar.
-#
-#  Fuzzy fast-path (latency optimisation) 
-# Queries whose every term is fully covered by fuzzy_rules.json skip the LLM
-# entirely.  Example: "few cyclists and rare pedestrians" — both terms map
-# to known filter values, so _interpret_query_impl returns immediately with
-# ~5 ms latency instead of ~500 ms–5 s.  The debug panel shows
-# " fuzzy rules only — LLM skipped" when this path is taken.
-#
-#  LCEL chain topology 
-#
-#   Input: {query: str, mode: str}
-#       │
-#       ▼  RunnableLambda(interpret_step)
-#   interpret_step
-#       • calls _interpret_query_impl(query || mode, llm=llm)
-#       • LLM (ChatOllama or ChatGroq) produces JSON {filters, semantic_query}
-#       • fuzzy-matched queries return early without LLM call
-#       • auto-detects effective_mode (Scene Search / Error Analysis)
-#       • measures t_interpret latency
-#       │
-#       ▼  RunnableLambda(filter_step)
-#   filter_step
-#       • calls _filter_docs_impl(effective_mode || filters_json)
-#       • pure Python numeric scan over scene_docs (7 481 docs) or
-#         error_docs (22 417 docs) — no LLM, typically <150 ms
-#       • returns up to 50 results + debug metadata
-#       • measures t_filter latency
-#       │
-#       ▼  RunnableBranch
-#   semantic_branch
-#       ├─ condition : len(filter_results) == 0
-#       │       ▼  RunnableLambda(semantic_step)
-#       │   semantic_step  — FAISS ANN search, top-10 by cosine similarity
-#       │                    search_mode = "semantic"
-#       └─ default  : RunnableLambda(filter_hit_step)
-#               filter_hit_step — no-op, semantic_results = []
-#                                 search_mode = "filter"
-#       │
-#       ▼  RunnableLambda(merge_step)
-#   merge_step
-#       • selects display_docs (filter_results preferred, semantic fallback)
-#       • assembles latency_ms dict for the debug panel
-#       • returns final output dict consumed by Streamlit UI
-#
-#  Upgrade path to full ReAct agent 
-# The three _impl functions are wrapped with @tool, making them agent-ready.
-# To restore LLM-driven tool orchestration (the LLM decides which tools to
-# call and in what order):
-#   1. Switch to a function-calling model:
-#        Local : ollama pull llama3.1:70b  or  ollama pull qwen2.5:14b
-#        Cloud : ChatGroq(model="llama-3.3-70b-versatile")  ← already available
-#                ChatOpenAI(model="gpt-4o")
-#   2. Re-enable create_react_agent(llm, tools=[interpret_query,
-#        filter_docs, semantic_search_tool], prompt=react_prompt)
-#   3. Replace KITTI_CHAIN with AgentExecutor(agent, tools, verbose=True)
 # =============================================================================
 
 def build_pipeline(llm_config: dict):
