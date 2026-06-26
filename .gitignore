@@ -7,3 +7,10 @@
 *.xlsx
 runs/detect/predict/kitti_labels/*
 runs/detect/predict/labels/*
+# Ignore Python cache folders
+*__pycache__
+*.ipynb_checkpoints
+#ignore notebook files
+jupyter/*
+*.cache
+

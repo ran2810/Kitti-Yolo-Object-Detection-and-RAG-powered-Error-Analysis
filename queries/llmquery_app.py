@@ -7,6 +7,7 @@ from PIL import Image
 import requests
 import re
 import cv2
+from pathlib import Path
 
 try:
     from groq import Groq
@@ -16,6 +17,9 @@ except ImportError:
 
 # enable to print statements
 print_debug = True
+
+current_dir = Path(__file__).resolve().parent
+parent_dir = current_dir.parent
 
 # Minimum cosine similarity GAP between the two modes to trust the embedding result.
 # Gap = best_mode_score - other_mode_score (not the absolute score).
@@ -444,10 +448,20 @@ def load_rag():
 
     model = SentenceTransformer(model_name)
 
-    return scene_docs, scene_index, error_docs, error_index, model
+    # CLIP image index (optional — skip if not yet built)
+    clip_index, clip_frame_ids, clip_model = None, [], None
+    if os.path.exists("../data/clip_index.faiss"):
+        clip_index = faiss.read_index("../data/clip_index.faiss")
+        with open("../data/clip_frame_ids.json", "r") as f:
+            clip_frame_ids = json.load(f)
+        clip_model = SentenceTransformer("clip-ViT-B-32")
+
+    return scene_docs, scene_index, error_docs, error_index, model, \
+           clip_index, clip_frame_ids, clip_model
 
 
-scene_docs, scene_index, error_docs, error_index, emb_model = load_rag()
+scene_docs, scene_index, error_docs, error_index, emb_model, \
+    clip_index, clip_frame_ids, clip_model = load_rag()
 
 # Build mode example embeddings once at startup (reuses already-loaded emb_model)
 mode_embeddings = build_mode_embeddings(emb_model)
@@ -507,6 +521,67 @@ def semantic_search(query, docs, index, embed_model, top_k=10):
     emb = embed_model.encode([query], convert_to_numpy=True).astype("float32")
     D, I = index.search(emb, top_k)
     return [docs[i] for i in I[0]]
+
+
+# ---------------------------------------------------------
+# CLIP VISUAL SEARCH
+# ---------------------------------------------------------
+def clip_encode_images(pil_images, model):
+    """
+    Encode a list of PIL images with CLIP and return the mean
+    L2-normalised embedding (support-set average).
+    """
+    embs = []
+    for img in pil_images:
+        e = model.encode(img, convert_to_numpy=True).astype("float32")
+        norm = np.linalg.norm(e)
+        if norm > 0:
+            e /= norm
+        embs.append(e)
+    mean_emb = np.mean(embs, axis=0).astype("float32")
+    mean_emb /= np.linalg.norm(mean_emb)          # renormalise after mean
+    return mean_emb
+
+
+def clip_encode_text(text, model):
+    """
+    Encode a text string with CLIP text encoder, L2-normalised.
+    """
+    e = model.encode(text, convert_to_numpy=True).astype("float32")
+    e /= np.linalg.norm(e)
+    return e
+
+
+def clip_search(query_emb, clip_index, clip_frame_ids, scene_docs, top_k=10):
+    """
+    Search the CLIP image index and return matching scene docs with scores.
+
+    :param query_emb: normalised 512-dim query vector (text or image)
+    :param clip_index: IndexFlatIP
+    :param clip_frame_ids: ordered list matching index positions
+    :param scene_docs: list of scene doc dicts (for image_path lookup)
+    :param top_k: number of results
+    :return: list of (score, frame_id, image_path)
+    """
+    q = query_emb.reshape(1, -1)
+    scores, indices = clip_index.search(q, top_k)
+
+    # Build a quick lookup from frame_id -> image_path
+    id_to_doc = {d["id"]: d for d in scene_docs}
+
+    results = []
+    for score, idx in zip(scores[0], indices[0]):
+        if idx < 0:
+            continue
+        fid = clip_frame_ids[idx]
+        doc = id_to_doc.get(fid, {})
+        results.append({
+            "frame_id": fid,
+            "score": float(score),
+            "image_path": doc.get("image_path", ""),
+            "summary_text": doc.get("summary_text", ""),
+        })
+    return results
 
 # ------------------------------------------------------------
 # VISUALIZATION HELPERS
@@ -643,7 +718,7 @@ top_k = st.slider("Number of results", 1, 10, 5)
 if query:
 
     # ---------------------------------------------------------
-    # STEP 1 — AUTO MODE DETECTION (embedding-based)
+    # AUTO MODE DETECTION (embedding-based)
     # ---------------------------------------------------------
     effective_mode, was_overridden, scores = auto_detect_mode(
         query, query_mode, mode_embeddings, emb_model
@@ -665,7 +740,7 @@ if query:
         )
 
     # ---------------------------------------------------------
-    # STEP 2 — LLM INTERPRETATION (query -> filters)
+    # LLM INTERPRETATION (query -> filters)
     # ---------------------------------------------------------
     parsed, llm_latency_ms = interpret_query_with_llm(query, effective_mode, llm_config)
     filters = parsed.get("filters", {})
@@ -691,7 +766,7 @@ if query:
         index = error_index
 
     # ---------------------------------------------------------
-    # STEP 3 — APPLY NUMERIC FILTERS
+    # APPLY NUMERIC FILTERS
     # ---------------------------------------------------------
     filtered_docs = apply_filters(docs, filters)
 
@@ -723,9 +798,10 @@ if query:
         for d in filtered_docs[:top_k]:
             st.subheader(f"Frame {d['id']}")
             st.write(d["summary_text"])
-            current_dir = os.path.dirname(__file__)
-            parent_dir  = os.path.dirname(current_dir)
-            img_path = os.path.normpath(os.path.join(parent_dir, d["image_path"]))
+            image_path = Path(*Path(d["image_path"]).parts[1:]) # Drop the leading ".."
+            # if print_debug:
+            #     print("\n image path:", image_path , " parent_dir", parent_dir)
+            img_path = parent_dir / image_path
             if effective_mode == "Error Analysis":
                 st.write(f"**Error Type:** {d['error_type']}")
                 st.write(f"**Class:** {d['class']}")
@@ -746,7 +822,7 @@ if query:
         st.warning("No matches for filters. Falling back to semantic search.")
 
     # ---------------------------------------------------------
-    # STEP 4 — SEMANTIC SEARCH
+    # SEMANTIC SEARCH
     # ---------------------------------------------------------
     results = semantic_search(semantic_query, docs, index, emb_model, top_k)
 
@@ -755,9 +831,8 @@ if query:
     for d in results:
         st.subheader(f"Frame {d['id']}")
         st.write(d["summary_text"])
-        current_dir = os.path.dirname(__file__)
-        parent_dir  = os.path.dirname(current_dir)
-        img_path = os.path.normpath(os.path.join(parent_dir, d["image_path"]))
+        image_path = Path(*Path(d["image_path"]).parts[1:]) # Drop the leading ".."
+        img_path = parent_dir / image_path
         
         if effective_mode == "Error Analysis":
             st.write(f"**Error Type:** {d['error_type']}")
@@ -765,11 +840,90 @@ if query:
             st.write(f"**IoU:** {d['iou']}")
             frame_errors = [e for e in error_docs if e["id"] == d["id"]]
 
+            # show GT and predicted images
             combined = render_side_by_side(d["id"], img_path, frame_errors)
             if combined is not None:
                 st.image(combined, caption="GT (left) vs Predictions (right)")
             else:
                 st.image(img_path)
-
+        # for scene search - show the image directly
         st.image(img_path)
 
+
+# ---------------------------------------------------------
+# VISUAL SEARCH (CLIP) — separate section below text query
+# ---------------------------------------------------------
+st.divider()
+st.markdown("## Visual Search (CLIP)")
+
+if clip_index is None:
+    st.warning(
+        "CLIP index not found. Run `generate_faiss_doc.py` to build it first.  \n"
+        "`python queries/generate_faiss_doc.py`"
+    )
+else:
+    clip_search_mode = st.radio(
+        "Query type",
+        ["Text -> Images", "Image -> Images"],
+        horizontal=True
+    )
+    clip_top_k = st.slider("Visual results", 1, 10, 5, key="clip_k")
+
+    # Text -> Images 
+    # works with full frame level context only but not minor object like - pedestrian crossing sign or . 
+    if clip_search_mode == "Text -> Images":
+        clip_text_query = st.text_input(
+            "Describe what you want to find visually -- full frame level context only",
+            placeholder="e.g. traffic light, parked vehicles, frames with railway tracks, road with tram line",
+            key="clip_text"
+        )
+        # run query, calculate latency and display top k results
+        if clip_text_query:
+            t0 = time.perf_counter()
+            q_emb = clip_encode_text(clip_text_query, clip_model)
+            latency_ms = (time.perf_counter() - t0) * 1000
+            results = clip_search(q_emb, clip_index, clip_frame_ids, scene_docs, clip_top_k)
+            st.caption(f" CLIP text encode + search — {latency_ms:.0f} ms")
+
+            st.markdown(f"**Top {clip_top_k} visually similar frames:**")
+            for r in results:
+                image_path = Path(*Path(r["image_path"]).parts[1:]) # Drop the leading ".."
+                img_path = parent_dir / image_path
+                st.subheader(f"Frame {r['frame_id']}  —  score {r['score']:.3f}")
+                st.caption(r["summary_text"])
+                st.image(img_path)
+
+    #  Image -> Images 
+    else:
+        st.caption(
+            "Upload 1-5 example images (support set). "
+            "Multiple images make the query more robust "
+        )
+        uploaded_files = st.file_uploader(
+            "Upload query image(s)",
+            type=["png", "jpg", "jpeg"],
+            accept_multiple_files=True,
+            key="clip_upload"
+        )
+        if uploaded_files:
+            pil_images = [Image.open(f).convert("RGB") for f in uploaded_files]
+
+            # Show thumbnails of uploaded support set
+            cols = st.columns(min(len(pil_images), 5))
+            for col, img in zip(cols, pil_images):
+                col.image(img, use_container_width=True)
+
+            # run query, measure latency and display top k results
+            t0 = time.perf_counter()
+            q_emb = clip_encode_images(pil_images, clip_model)
+            latency_ms = (time.perf_counter() - t0) * 1000
+            results = clip_search(q_emb, clip_index, clip_frame_ids, scene_docs, clip_top_k)
+            st.caption(f" CLIP image encode ({len(pil_images)} image(s)) + search — {latency_ms:.0f} ms")
+            
+            st.markdown(f"**Top {clip_top_k} visually similar frames:**")
+            for r in results:
+                image_path = Path(*Path(r["image_path"]).parts[1:]) # Drop the leading ".."
+                img_path = parent_dir / image_path
+                st.subheader(f"Frame {r['frame_id']}  —  score {r['score']:.3f}")
+                st.caption(r["summary_text"])
+                st.image(img_path)

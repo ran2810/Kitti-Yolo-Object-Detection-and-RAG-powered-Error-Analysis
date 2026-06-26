@@ -1,5 +1,7 @@
 import os, json
+import numpy as np
 from sentence_transformers import SentenceTransformer
+from PIL import Image
 import faiss
 from tqdm import tqdm
 
@@ -241,6 +243,53 @@ def build_kitti_index(label_dir, image_dir, pred_dir):
 
 
 # ------------------------------------------------------------
+# CLIP IMAGE INDEX
+# ------------------------------------------------------------
+def build_clip_index(image_dir):
+    """
+    Build a CLIP image embedding index over all KITTI frames.
+
+    Uses cosine similarity (IndexFlatIP on L2-normalised vectors).
+    Dimension: 512 (clip-ViT-B-32).
+    """
+    clip_model = SentenceTransformer("clip-ViT-B-32")
+
+    image_files = sorted(
+        f for f in os.listdir(image_dir) if f.lower().endswith(".png")
+    )
+
+    frame_ids = []
+    embeddings = []
+
+    # iterate over images. show progress
+    for fname in tqdm(image_files, desc="Building CLIP index"):
+        frame_id = fname.rsplit(".", 1)[0]
+        img_path = os.path.join(image_dir, fname)
+        try:
+            img = Image.open(img_path).convert("RGB")
+            # default tensors. enable numpy true
+            emb = clip_model.encode(img, convert_to_numpy=True).astype("float32")
+            # L2-normalise so IndexFlatIP == cosine similarity
+            norm = np.linalg.norm(emb)
+            if norm > 0:
+                emb /= norm
+            frame_ids.append(frame_id)
+            embeddings.append(emb)
+        except Exception as e:
+            print(f"  Skipping {fname}: {e}")
+
+    embeddings = np.stack(embeddings).astype("float32")   # (N, 512)
+    dim = embeddings.shape[1]
+
+    # IndexFlatIP: inner product on normalised vectors = cosine similarity
+    index = faiss.IndexFlatIP(dim)
+    index.add(embeddings)
+
+    print(f"CLIP index built: {len(frame_ids)} frames, dim={dim}")
+    return frame_ids, index
+
+
+# ------------------------------------------------------------
 # CLI ENTRY POINT
 # ------------------------------------------------------------
 if __name__ == "__main__":
@@ -248,19 +297,32 @@ if __name__ == "__main__":
     image_dir = "../data/training/image_2"
     pred_dir = "../runs/detect/predict/kitti_labels"
 
-    scene_docs, scene_index, error_docs, error_index, model = build_kitti_index(label_dir, image_dir, pred_dir)
+    # Text indexes 
+    scene_docs, scene_index, error_docs, error_index, model = build_kitti_index(
+        label_dir, image_dir, pred_dir
+    )
 
-    # Save scene docs
-    with open("data/kitti_docs.json", "w") as f:
+    # scene index
+    with open("../data/kitti_docs.json", "w") as f:
         json.dump(scene_docs, f, indent=2)
     faiss.write_index(scene_index, "../data/kitti_index.faiss")
 
-    # Save error docs
+    # error idnex
     with open("../data/error_docs.json", "w") as f:
+        
         json.dump(error_docs, f, indent=2)
     if error_index:
         faiss.write_index(error_index, "../data/error_index.faiss")
 
-    # Save embedding model name
+    # store mode name
     with open("../data/embedding_model.txt", "w") as f:
         f.write("all-MiniLM-L6-v2")
+
+    #  CLIP image index 
+    clip_frame_ids, clip_index = build_clip_index(image_dir)
+
+    faiss.write_index(clip_index, "../data/clip_index.faiss")
+    with open("../data/clip_frame_ids.json", "w") as f:
+        json.dump(clip_frame_ids, f, indent=2)
+
+    print("All indexes saved to ../data/")
