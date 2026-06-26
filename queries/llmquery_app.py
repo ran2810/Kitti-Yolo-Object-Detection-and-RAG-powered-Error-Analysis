@@ -1,5 +1,5 @@
 import streamlit as st
-import json, os
+import json, os, time
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -8,8 +8,150 @@ import requests
 import re
 import cv2
 
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False  
+
 # enable to print statements
 print_debug = True
+
+# Minimum cosine similarity GAP between the two modes to trust the embedding result.
+# Gap = best_mode_score - other_mode_score (not the absolute score).
+# Typical ranges based on examples: confident classification gap ~0.10-0.25, ambiguous query gap ~0.01-0.05.
+# If gap is below this, the classifier is uncertain and falls back to keyword check.
+CONFIDENCE_THRESHOLD = 0.08
+
+# ---------------------------------------------------------
+# AUTO MODE DETECTION — embedding-based intent classification
+# ---------------------------------------------------------
+# Example queries that represent each mode -> Encode at startup -> Find similiarity via cosine
+MODE_EXAMPLES = {
+    "Error Analysis": [
+        "find missed pedestrians",
+        "wrongly detected objects with high occlusion",
+        "false positives for cyclists",
+        "frames where cars were not detected",
+        "detection errors with high truncation",
+        "objects the model failed to detect",
+        "incorrectly predicted bounding boxes",
+        "undetected cyclists in the scene",
+        "high IoU mismatches",
+        "false negative cars with occlusion",
+    ],
+    "Scene Search": [
+        "scenes with many cars",
+        "frames with high occlusion",
+        "find busy intersections with pedestrians",
+        "scenes with cyclists and pedestrians together",
+        "frames with low truncation and many objects",
+        "crowded urban scenes",
+        "find frames with more than three pedestrians",
+        "scenes where cyclists are present",
+        "frames with high object density",
+        "urban driving with multiple road users",
+    ]
+}
+
+# Keyword fallback — used when embedding similarity is below CONFIDENCE_THRESHOLD
+# so that unambiguous error terms still work even if the model is not yet loaded
+ERROR_KEYWORDS = {
+    "missed", "false positive", "false negative", "fp", "fn",
+    "error", "iou", "wrong detection", "missed detection",
+    "undetected", "incorrectly detected", "wrongly detected"
+}
+
+
+def build_mode_embeddings(model):
+    """
+    Encode MODE_EXAMPLES once at startup using the provided sentence-transformer model.
+    Returns a dict: { mode_name -> np.ndarray of shape (n_examples, dim) }
+
+    :param model: loaded SentenceTransformer instance
+    """
+    mode_embeddings = {}
+    for mode, examples in MODE_EXAMPLES.items():
+        # encode examples. Normalize so that cosine similarity = dot product
+        embs = model.encode(examples, convert_to_numpy=True, normalize_embeddings=True)
+        mode_embeddings[mode] = embs  # shape: (n_examples, 384)
+    return mode_embeddings
+
+
+def auto_detect_mode(query, user_mode, mode_embeddings, model):
+    """
+    Classify query intent using cosine similarity against MODE_EXAMPLES embeddings.
+
+    :param query:           user query string
+    :param user_mode:       mode hint from sidebar
+    :param mode_embeddings: dict returned by build_mode_embeddings()
+    :param model:           loaded SentenceTransformer instance
+    :return: (effective_mode, was_overridden, scores)
+             scores = {'Error Analysis': float, 'Scene Search': float}
+    """
+    # encode query — normalised. cosine similarity = dot product
+    q_emb = model.encode([query], convert_to_numpy=True, normalize_embeddings=True)[0]
+
+    scores = {}
+    for mode, embs in mode_embeddings.items():
+        # mean cosine similarity across all examples for this mode
+        scores[mode] = float(np.mean(embs @ q_emb))
+
+    # iterate via scores.get for values
+    best_mode  = max(scores, key=scores.get)
+    score_gap  = scores[best_mode] - scores[min(scores, key=scores.get)]
+
+    if print_debug:
+        print(f"\nAUTO-DETECT scores: {scores}  gap: {score_gap:.4f}")
+
+    if score_gap >= CONFIDENCE_THRESHOLD:
+        # Embedding classifier is confident
+        effective_mode = best_mode
+    else:
+        # Ambiguous — fall back to keyword check
+        query_lower = query.lower()
+        if any(kw in query_lower for kw in ERROR_KEYWORDS):
+            effective_mode = "Error Analysis"
+        # keep sidebar hint
+        else:
+            effective_mode = user_mode   
+
+    was_overridden = (effective_mode != user_mode)
+    return effective_mode, was_overridden, scores
+
+
+# ---------------------------------------------------------
+# LLM CALL ROUTER — Ollama (local) or Groq (cloud)
+# ---------------------------------------------------------
+def call_llm(prompt, llm_config):
+    """
+    Route LLM call to Ollama (local) or Groq (cloud) based on llm_config.
+    Returns raw response string from the model.
+
+    :param prompt: prompt string to send to the model
+    :param llm_config: dict with keys 'provider', 'model', 'api_key' (Groq only)
+    """
+    provider = llm_config.get("provider", "Ollama")
+    model    = llm_config.get("model", "llama3")
+
+    if provider == "Groq":
+        api_key = llm_config.get("api_key", "")
+        if not api_key:
+            raise ValueError("Groq API key is required.")
+        client = Groq(api_key=api_key)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        return response.choices[0].message.content.strip()
+
+    else:  # Ollama (local)
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": model, "prompt": prompt, "stream": False}
+        )
+        return response.json().get("response", "").strip()
 
 def load_fuzzy_rules():
     """
@@ -19,7 +161,6 @@ def load_fuzzy_rules():
         return json.load(f)
 
 FUZZY_RULES = load_fuzzy_rules()
-
 
 def expand_fuzzy_terms(query):
     """
@@ -83,12 +224,11 @@ def sanitize_json(text):
     text = text.replace('""', '"')
     return text
 
-
 def extract_json_block(text):
     """
     Extract the first JSON block from LLM output.
-    
-    :param text: Description
+
+    :param text: LLM raw output string
     """
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
@@ -100,20 +240,108 @@ def extract_json_block(text):
         return None
 
 
+# Operator string patterns the LLM sometimes outputs instead of {"op": value}
+# e.g. ">0", "> 0", ">=2", "<= 1.0"
+_OP_STRING_RE = re.compile(r'^(>=|<=|>|<|==)\s*(-?\d+(?:\.\d+)?)$')
+
+# MongoDB-style operator aliases some models use
+_MONGO_OPS = {"$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<=", "$eq": "=="}
+
+def _coerce_numeric(val):
+    """Convert string number to int or float."""
+    try:
+        f = float(val)
+        return int(f) if f == int(f) else f
+    except (ValueError, TypeError):
+        return val
+
+def normalize_filters(filters):
+    """
+    Normalise LLM filter output to the format apply_filters() expects:
+      - operator dict:  {">=": 2}
+      - scalar:         "FN"  (equality)
+      - list:           ["FP", "FN"]  (membership)
+
+    Handles common LLM output variations:
+      ">0"          -> {">":  0}     (op+value fused into string)
+      "> 0"         -> {">":  0}     (op+value with space)
+      {"$gt": 0}    -> {">":  0}     (MongoDB-style operators)
+      {">": "2"}    -> {">":  2}     (numeric value as string)
+      0  (scalar)   -> {">" : 0}     (bare 0 for numeric range fields means > 0)
+
+    :param filters: raw filters dict from LLM
+    :return: normalised filters dict
+    """
+    # Numeric range fields — bare scalar 0 almost always means "> 0" in context
+    RANGE_FIELDS = {
+        "num_cars", "num_pedestrians", "num_cyclists",
+        "max_occlusion", "max_truncation",
+        "occlusion_level", "truncation_value", "iou"
+    }
+
+    normalised = {}
+
+    for key, cond in filters.items():
+
+        #  list: keep as-is 
+        if isinstance(cond, list):
+            normalised[key] = cond
+            continue
+
+        #  string: may be fused op+value e.g. ">0" or plain scalar 
+        if isinstance(cond, str):
+            m = _OP_STRING_RE.match(cond.strip())
+            if m:
+                op, val = m.group(1), _coerce_numeric(m.group(2))
+                normalised[key] = {op: val}
+            else:
+                normalised[key] = cond   # plain string equality (e.g. "FN")
+            continue
+
+        #  numeric scalar 
+        if isinstance(cond, (int, float)):
+            if key in RANGE_FIELDS and cond == 0:
+                # "occlusion_level: 0" from LLM almost always means > 0
+                normalised[key] = {">": 0}
+            else:
+                normalised[key] = cond   # genuine equality (e.g. num_cars: 3)
+            continue
+
+        # dict: operator dict
+        if isinstance(cond, dict):
+            clean = {}
+            for op, val in cond.items():
+                # remap MongoDB operators
+                op = _MONGO_OPS.get(op, op)
+                # coerce string numeric values
+                val = _coerce_numeric(val) if isinstance(val, str) else val
+                clean[op] = val
+            normalised[key] = clean
+            continue
+
+        # fallback: keep unchanged
+        normalised[key] = cond
+
+    return normalised
+
 # ---------------------------------------------------------
 # LLM INTERPRETER (Ollama Llama3 - Scene + Error Mode)
 # ---------------------------------------------------------
-def interpret_query_with_llm(query, mode):
+# improvise prompt to handle false negative(s) cars(for cars) with occlusion ( 0)
+def interpret_query_with_llm(query, mode, llm_config):
     """
-    convert the query into filter (json format - dict) by asking prompt to LLM model
-    
-    :param query: user query from streamlit
+    Convert the user query into a filter dict + semantic query string
+    by asking the LLM. Routes to Ollama or Groq based on llm_config.
+
+    :param query: user query string from streamlit
+    :param mode: effective mode ('Scene Search' or 'Error Analysis')
+    :param llm_config: dict with keys 'provider', 'model', 'api_key'
     """
     fuzzy_hits = expand_fuzzy_terms(query)
 
     fuzzy_instructions = ""
     for term in fuzzy_hits:
-        fuzzy_instructions += f'"{term}" → {json.dumps(FUZZY_RULES[term]["filters"])}\n'
+        fuzzy_instructions += f'"{term}" -> {json.dumps(FUZZY_RULES[term]["filters"])}\n'
 
     prompt = f"""
 You are a query interpreter for a KITTI dataset explorer.
@@ -140,52 +368,56 @@ Two modes:
      - occlusion_level
      - truncation_value
 
-Valid operators: ">", ">=", "<", "<=", "=="
+Valid operators for numeric fields: ">", ">=", "<", "<=", "=="
+ALWAYS use a dict for operator conditions: {{">=": 2}} not ">=2" or ">= 2".
+NEVER use MongoDB-style operators ($gt, $gte, etc.).
+NEVER use bare 0 for a range condition — write {{">": 0}} to mean "greater than zero".
 
-Fuzzy → Numeric rules:
+Examples (Error Analysis):
+  "false negatives for cars with any occlusion"
+  -> {{"filters": {{"error_type": "FN", "class": "Car", "occlusion_level": {{">": 0}}}}, "semantic_query": "false negatives for cars with occlusion"}}
+
+  "false positives for pedestrians with occlusion level 2 or more"
+  -> {{"filters": {{"error_type": "FP", "class": "Pedestrian", "occlusion_level": {{">=": 2}}}}, "semantic_query": "false positives for occluded pedestrians"}}
+
+Examples (Scene Search):
+  "scenes with more than 3 cars"
+  -> {{"filters": {{"num_cars": {{">": 3}}}}, "semantic_query": "scenes with many cars"}}
+
+Fuzzy -> Numeric rules:
 {fuzzy_instructions}
 
 User query: "{query}"
 Mode: "{mode}"
 
-Return ONLY JSON. No explanations.
+Return ONLY the JSON object. No explanation, no markdown, no code fences.
 """
 
     try:
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "llama3",
-                "prompt": prompt,
-                "stream": False
-            }
-        )
+        t0 = time.perf_counter()
+        raw = call_llm(prompt, llm_config)
+        llm_latency_ms = (time.perf_counter() - t0) * 1000
 
-        # get the raw response
-        raw = response.json().get("response", "").strip()
         if print_debug:
             print("\nRAW LLM OUTPUT:\n", raw)
+            print(f"\nLLM latency: {llm_latency_ms:.0f} ms")
 
-        # Extract JSON block
         parsed = extract_json_block(raw)
         if parsed is None:
             raise ValueError("No JSON found")
-        
+
+        # Normalise operator formats before returning (handles LLM drift)
+        if "filters" in parsed and isinstance(parsed["filters"], dict):
+            parsed["filters"] = normalize_filters(parsed["filters"])
+
         if print_debug:
             print("\nPARSED JSON:\n", parsed)
-        
-        # return query as dict (query -> filters)
-        return parsed
-    
-        # # Replace Mongo-style operators
-        # json_text = json_text.replace("$gt", ">")
-        # json_text = json_text.replace("$lt", "<")
-        # json_text = json_text.replace("$gte", ">=")
-        # json_text = json_text.replace("$lte", "<=")
+
+        return parsed, llm_latency_ms
 
     except Exception as e:
         print("LLM error:", e)
-        return {"filters": {}, "semantic_query": query}
+        return {"filters": {}, "semantic_query": query}, None
 
 
 # ---------------------------------------------------------
@@ -217,6 +449,9 @@ def load_rag():
 
 scene_docs, scene_index, error_docs, error_index, emb_model = load_rag()
 
+# Build mode example embeddings once at startup (reuses already-loaded emb_model)
+mode_embeddings = build_mode_embeddings(emb_model)
+
 # ---------------------------------------------------------
 # FILTER ENGINE (supports dict, list, scalar)
 # ---------------------------------------------------------
@@ -228,14 +463,14 @@ def apply_filters(docs, filters):
 
         for key, cond in filters.items():
 
-            # 1) List → equality set
+            # 1) List -> equality set
             if isinstance(cond, list):
                 if d.get(key) not in cond:
                     ok = False
                     break
                 continue
 
-            # 2) Scalar → equality
+            # 2) Scalar -> equality
             if not isinstance(cond, dict):
                 if d.get(key) != cond:
                     ok = False
@@ -363,10 +598,44 @@ def render_side_by_side(frame_id, image_path, frame_errors):
 # ---------------------------------------------------------
 st.title("KITTI RAG Explorer (Scene Search + Error Analysis)")
 st.write("Ask natural language questions about KITTI scenes, objects, occlusion, truncation, or counts.")
-st.write("color Code info: FP as red, FN as blue")
+st.write("Color code: FP = red, FN = blue")
 
-# USER UI
-query_mode = st.sidebar.selectbox("Query Mode", ["Scene Search", "Error Analysis"])
+# ---------------------------------------------------------
+# SIDEBAR — LLM Provider
+# ---------------------------------------------------------
+st.sidebar.markdown("## LLM Provider")
+llm_provider = st.sidebar.radio("Backend", ["Ollama (local)", "Groq (cloud)"])
+
+if llm_provider == "Ollama (local)":
+    ollama_model = st.sidebar.selectbox("Ollama Model", ["llama3", "llama3.1", "mistral"])
+    st.sidebar.caption(f"Running locally via Ollama — model: {ollama_model}")
+    llm_config = {"provider": "Ollama", "model": ollama_model, "api_key": ""}
+else:
+    if not GROQ_AVAILABLE:
+        st.sidebar.error("groq package not installed -> pip install groq")
+    groq_model = st.sidebar.selectbox(
+        "Groq Model",
+        ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+    )
+    groq_key = st.sidebar.text_input("Groq API Key", type="password")
+    st.sidebar.caption(f"Groq cloud — model: {groq_model}")
+    llm_config = {"provider": "Groq", "model": groq_model, "api_key": groq_key}
+
+st.sidebar.divider()
+
+# ---------------------------------------------------------
+# SIDEBAR — Mode Hint (can be overridden by auto-detection)
+# ---------------------------------------------------------
+st.sidebar.markdown("### Mode Hint")
+st.sidebar.caption(
+    "Auto-detection overrides this if error-related keywords "
+    "(missed, FP, FN, IoU ...) are found in your query."
+)
+query_mode = st.sidebar.selectbox("Mode Hint", ["Scene Search", "Error Analysis"])
+
+# ---------------------------------------------------------
+# MAIN — Query input
+# ---------------------------------------------------------
 query = st.text_input("Enter your query")
 top_k = st.slider("Number of results", 1, 10, 5)
 
@@ -374,17 +643,47 @@ top_k = st.slider("Number of results", 1, 10, 5)
 if query:
 
     # ---------------------------------------------------------
-    # STEP 1 — LLM INTERPRETATION (query - filters)
+    # STEP 1 — AUTO MODE DETECTION (embedding-based)
     # ---------------------------------------------------------
-    parsed = interpret_query_with_llm(query, query_mode)
+    effective_mode, was_overridden, scores = auto_detect_mode(
+        query, query_mode, mode_embeddings, emb_model
+    )
+
+    # print the mode 
+    if was_overridden:
+        st.info(
+            f"Auto-detected mode: **{effective_mode}** "
+            f"(overrode sidebar hint: '{query_mode}')  "
+            f"— scores: Error Analysis {scores['Error Analysis']:.3f} "
+            f"| Scene Search {scores['Scene Search']:.3f}"
+        )
+    else:
+        st.info(
+            f"Mode: **{effective_mode}**  "
+            f"— scores: Error Analysis {scores['Error Analysis']:.3f} "
+            f"| Scene Search {scores['Scene Search']:.3f}"
+        )
+
+    # ---------------------------------------------------------
+    # STEP 2 — LLM INTERPRETATION (query -> filters)
+    # ---------------------------------------------------------
+    parsed, llm_latency_ms = interpret_query_with_llm(query, effective_mode, llm_config)
     filters = parsed.get("filters", {})
     semantic_query = parsed.get("semantic_query", query)
 
     st.markdown("### LLM Interpretation")
+    if llm_latency_ms is not None:
+        provider_label = llm_config.get("provider", "LLM")
+        model_label    = llm_config.get("model", "")
+        color = "green" if llm_latency_ms < 1000 else ("orange" if llm_latency_ms < 3000 else "red")
+        st.caption(
+            f"**{provider_label}** ({model_label}) — "
+            f":{color}[{llm_latency_ms:.0f} ms]"
+        )
     st.json(parsed)
 
-    # Select dataset
-    if query_mode == "Scene Search":
+    # Select dataset based on effective mode
+    if effective_mode == "Scene Search":
         docs = scene_docs
         index = scene_index
     else:
@@ -392,7 +691,7 @@ if query:
         index = error_index
 
     # ---------------------------------------------------------
-    # STEP 2 — APPLY NUMERIC FILTERS
+    # STEP 3 — APPLY NUMERIC FILTERS
     # ---------------------------------------------------------
     filtered_docs = apply_filters(docs, filters)
 
@@ -427,7 +726,7 @@ if query:
             current_dir = os.path.dirname(__file__)
             parent_dir  = os.path.dirname(current_dir)
             img_path = os.path.normpath(os.path.join(parent_dir, d["image_path"]))
-            if query_mode == "Error Analysis":
+            if effective_mode == "Error Analysis":
                 st.write(f"**Error Type:** {d['error_type']}")
                 st.write(f"**Class:** {d['class']}")
                 st.write(f"**IoU:** {d['iou']}")
@@ -447,7 +746,7 @@ if query:
         st.warning("No matches for filters. Falling back to semantic search.")
 
     # ---------------------------------------------------------
-    # STEP 3 — SEMANTIC SEARCH
+    # STEP 4 — SEMANTIC SEARCH
     # ---------------------------------------------------------
     results = semantic_search(semantic_query, docs, index, emb_model, top_k)
 
@@ -460,7 +759,7 @@ if query:
         parent_dir  = os.path.dirname(current_dir)
         img_path = os.path.normpath(os.path.join(parent_dir, d["image_path"]))
         
-        if query_mode == "Error Analysis":
+        if effective_mode == "Error Analysis":
             st.write(f"**Error Type:** {d['error_type']}")
             st.write(f"**Class:** {d['class']}")
             st.write(f"**IoU:** {d['iou']}")

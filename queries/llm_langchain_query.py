@@ -720,7 +720,7 @@ else:
     groq_key = st.sidebar.text_input(
         "Groq API key",
         type="password",
-        help="Free key at console.groq.com — no credit card needed.",
+        help="Free key at console.groq.com",
         placeholder="gsk_...",
     )
     groq_model = st.sidebar.selectbox(
@@ -859,7 +859,7 @@ def build_pipeline(llm_config: dict):
 
     #  Step 2: exact numeric filter 
     # RunnableLambda wrapping _filter_docs_impl.  Pure Python scan — fast
-    # even for 20 k+ docs.  Returns up to 50 results for pagination.
+    # even for 20 k+ docs.  Returns up to 50 results.
     def filter_step(inputs: dict) -> dict:
         """
         Step 2 — apply structured filters against the correct doc corpus.
