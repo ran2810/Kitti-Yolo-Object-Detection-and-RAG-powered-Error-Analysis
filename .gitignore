@@ -13,4 +13,5 @@ runs/detect/predict/labels/*
 #ignore notebook files
 jupyter/*
 *.cache
+**/queries/**/*.png
 

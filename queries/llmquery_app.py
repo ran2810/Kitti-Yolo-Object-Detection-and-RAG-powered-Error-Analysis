@@ -9,28 +9,28 @@ import re
 import cv2
 from pathlib import Path
 
+# check groq availability 
 try:
     from groq import Groq
     GROQ_AVAILABLE = True
 except ImportError:
-    GROQ_AVAILABLE = False  
+    GROQ_AVAILABLE = False
 
-# enable to print statements
+# enable print debug statements
 print_debug = True
 
+# get parent dir to join with images path
 current_dir = Path(__file__).resolve().parent
 parent_dir = current_dir.parent
 
-# Minimum cosine similarity GAP between the two modes to trust the embedding result.
-# Gap = best_mode_score - other_mode_score (not the absolute score).
-# Typical ranges based on examples: confident classification gap ~0.10-0.25, ambiguous query gap ~0.01-0.05.
-# If gap is below this, the classifier is uncertain and falls back to keyword check.
+
+# ------------------------------------------------------------
+# AUTOMATIC MODE (SCENE or ERROR) DETECTIOn
+# ------------------------------------------------------------
+# min cosine similarity gap between modes to trust embedding
 CONFIDENCE_THRESHOLD = 0.08
 
-# ---------------------------------------------------------
-# AUTO MODE DETECTION — embedding-based intent classification
-# ---------------------------------------------------------
-# Example queries that represent each mode -> Encode at startup -> Find similiarity via cosine
+# example queries per mode  --> encoded at startup for cosine similarity classification
 MODE_EXAMPLES = {
     "Error Analysis": [
         "find missed pedestrians",
@@ -58,169 +58,131 @@ MODE_EXAMPLES = {
     ]
 }
 
-# Keyword fallback — used when embedding similarity is below CONFIDENCE_THRESHOLD
-# so that unambiguous error terms still work even if the model is not yet loaded
+# keyword fallback when embedding gap is below threshold
 ERROR_KEYWORDS = {
     "missed", "false positive", "false negative", "fp", "fn",
     "error", "iou", "wrong detection", "missed detection",
     "undetected", "incorrectly detected", "wrongly detected"
 }
 
-
 def build_mode_embeddings(model):
-    """
-    Encode MODE_EXAMPLES once at startup using the provided sentence-transformer model.
-    Returns a dict: { mode_name -> np.ndarray of shape (n_examples, dim) }
-
-    :param model: loaded SentenceTransformer instance
-    """
+    """Encode MODE_EXAMPLES once at startup and return per-mode(scene & error) embedding matrix."""
     mode_embeddings = {}
     for mode, examples in MODE_EXAMPLES.items():
-        # encode examples. Normalize so that cosine similarity = dot product
         embs = model.encode(examples, convert_to_numpy=True, normalize_embeddings=True)
-        mode_embeddings[mode] = embs  # shape: (n_examples, 384)
+        mode_embeddings[mode] = embs
     return mode_embeddings
 
-
 def auto_detect_mode(query, user_mode, mode_embeddings, model):
-    """
-    Classify query intent using cosine similarity against MODE_EXAMPLES embeddings.
-
-    :param query:           user query string
-    :param user_mode:       mode hint from sidebar
-    :param mode_embeddings: dict returned by build_mode_embeddings()
-    :param model:           loaded SentenceTransformer instance
-    :return: (effective_mode, was_overridden, scores)
-             scores = {'Error Analysis': float, 'Scene Search': float}
-    """
-    # encode query — normalised. cosine similarity = dot product
+    """Classify query as Scene Search or Error Analysis via cosine similarity based on threshold"""
     q_emb = model.encode([query], convert_to_numpy=True, normalize_embeddings=True)[0]
 
-    scores = {}
-    for mode, embs in mode_embeddings.items():
-        # mean cosine similarity across all examples for this mode
-        scores[mode] = float(np.mean(embs @ q_emb))
-
-    # iterate via scores.get for values
-    best_mode  = max(scores, key=scores.get)
-    score_gap  = scores[best_mode] - scores[min(scores, key=scores.get)]
+    scores = {mode: float(np.mean(embs @ q_emb)) for mode, embs in mode_embeddings.items()}
+    best_mode = max(scores, key=scores.get)
+    score_gap = scores[best_mode] - scores[min(scores, key=scores.get)]
 
     if print_debug:
         print(f"\nAUTO-DETECT scores: {scores}  gap: {score_gap:.4f}")
 
     if score_gap >= CONFIDENCE_THRESHOLD:
-        # Embedding classifier is confident
+        # embedding gap is large enough to trust the classifier
         effective_mode = best_mode
     else:
-        # Ambiguous — fall back to keyword check
+        # fall back to keyword check when gap is too small
         query_lower = query.lower()
-        if any(kw in query_lower for kw in ERROR_KEYWORDS):
-            effective_mode = "Error Analysis"
-        # keep sidebar hint
-        else:
-            effective_mode = user_mode   
+        effective_mode = "Error Analysis" if any(kw in query_lower for kw in ERROR_KEYWORDS) else user_mode
 
     was_overridden = (effective_mode != user_mode)
     return effective_mode, was_overridden, scores
 
 
 # ---------------------------------------------------------
-# LLM CALL ROUTER — Ollama (local) or Groq (cloud)
+# LLM CONFIG -> Ollama or Groq
 # ---------------------------------------------------------
 def call_llm(prompt, llm_config):
-    """
-    Route LLM call to Ollama (local) or Groq (cloud) based on llm_config.
-    Returns raw response string from the model.
-
-    :param prompt: prompt string to send to the model
-    :param llm_config: dict with keys 'provider', 'model', 'api_key' (Groq only)
-    """
+    """Route prompt to Groq cloud or Ollama local and return raw response string."""
     provider = llm_config.get("provider", "Ollama")
     model    = llm_config.get("model", "llama3")
 
     if provider == "Groq":
+        # call Groq cloud API
         api_key = llm_config.get("api_key", "")
         if not api_key:
+            # key is required
             raise ValueError("Groq API key is required.")
         client = Groq(api_key=api_key)
         response = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0,
+            temperature=0,  # added temperature to get deterministic o/p with query expansion in CLIP
         )
         return response.choices[0].message.content.strip()
 
-    else:  # Ollama (local)
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False}
-        )
-        return response.json().get("response", "").strip()
+    # Ollama local inference with temperature=0 for deterministic output
+    response = requests.post(
+        "http://localhost:11434/api/generate",
+        json={"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0}}
+    )
+    return response.json().get("response", "").strip()
 
+
+# ------------------------------------------------------------
+# FUZZY WORDS Handling for querying
+# ------------------------------------------------------------
 def load_fuzzy_rules():
-    """
-    # load json for fuzzy rules
-    """
+    """Load fuzzy synonym rules from JSON."""
     with open("../data/fuzzy_rules.json", "r") as f:
         return json.load(f)
 
 FUZZY_RULES = load_fuzzy_rules()
 
+
 def expand_fuzzy_terms(query):
-    """
-    check for synonyms or letter casing
-    
-    :param query: user query from streamlit
-    """
+    """Return list of canonical fuzzy terms matched in the query via synonyms."""
     query_lower = query.lower()
-
     detected = []
-
     for key, rule in FUZZY_RULES.items():
-        # Check canonical term - lower case
-        if key in query_lower:
+        if key in query_lower or any(syn in query_lower for syn in rule["synonyms"]):
             detected.append(key)
-            continue
-
-        # Check synonyms
-        for syn in rule["synonyms"]:
-            if syn in query_lower:
-                detected.append(key)
-                break
-
     return detected
 
-# ------------------------------------------------------------
-# KITTI PARSER (for GT + predictions)
-# ------------------------------------------------------------
-def parse_kitti_label_file(path):
-    if not os.path.exists(path):
-        return []
-    objs = []
-    with open(path) as f:
-        for line in f:
-            parts = line.strip().split()
-            objs.append({
-                "type": parts[0],
-                "truncated": float(parts[1]),
-                "occluded": int(parts[2]),
-                "alpha": float(parts[3]),
-                "bbox": list(map(float, parts[4:8])),
-                "dimensions": list(map(float, parts[8:11])),
-                "location": list(map(float, parts[11:14])),
-                "rotation_y": float(parts[14])
-            })
-    return objs
 
-# ---------------------------------------------------------
-# JSON SANITIZATION
-# ---------------------------------------------------------
-def sanitize_json(text):
-    """
-    Fix malformed operator keys like "" >= or " >=".
+# words that carry no filter intent and should not block the fuzzy-only fast path
+STOPWORDS = {
+    # conjunctions / articles / prepositions
+    "and", "or", "with", "the", "a", "an", "some", "of", "in", "for",
+    "very", "quite", "mostly", "mainly", "also", "both",
+    # scene-context nouns that describe setting but map to no numeric field
+    "intersection", "scene", "frame", "image", "road", "street",
+    "area", "zone", "environment", "conditions", "scenario",
+    # common adjectives that describe scene mood, not measurable counts
+    "active", "urban", "typical", "normal",
+}
+
+def is_fuzzy_only(query, fuzzy_hits):
+    """Return True if fuzzy rules cover all meaningful (non-stopword) tokens in the query."""
     
-    :param text: Description
-    """
+    if not fuzzy_hits:
+        return False
+    residual = query.lower()
+    # strip every matched fuzzy term and its synonyms from the query
+    for term in fuzzy_hits:
+        # strip matched fuzzy term
+        residual = residual.replace(term, " ")
+        for syn in FUZZY_RULES[term]["synonyms"]:
+            residual = residual.replace(syn, " ")
+    # check if any non-stopword tokens remain
+    remaining = {w for w in residual.split() if w not in STOPWORDS}
+
+    # if remaining is empty -> true
+    return len(remaining) == 0
+
+
+# ------------------------------------------------------------
+# JSON FORMATING
+# ------------------------------------------------------------
+def format_json(text):
+    """Fix malformed operator strings like '">=' or '"  >=' that LLMs sometimes emit."""
     text = re.sub(r'"\s*>=\s*"', '">="', text)
     text = re.sub(r'"\s*>\s*"', '">"', text)
     text = re.sub(r'"\s*<=\s*"', '"<="', text)
@@ -229,30 +191,25 @@ def sanitize_json(text):
     return text
 
 def extract_json_block(text):
-    """
-    Extract the first JSON block from LLM output.
-
-    :param text: LLM raw output string
-    """
+    """Extract and parse the first JSON object from LLM output."""
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
         return None
-    block = sanitize_json(match.group(0))
+    block = format_json(match.group(0))
     try:
         return json.loads(block)
     except:
         return None
 
 
-# Operator string patterns the LLM sometimes outputs instead of {"op": value}
-# e.g. ">0", "> 0", ">=2", "<= 1.0"
+# regex for fused operator strings like ">0" or "<= 1.5"
 _OP_STRING_RE = re.compile(r'^(>=|<=|>|<|==)\s*(-?\d+(?:\.\d+)?)$')
 
-# MongoDB-style operator aliases some models use
+# map MongoDB-style operators to standard ones
 _MONGO_OPS = {"$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<=", "$eq": "=="}
 
 def _coerce_numeric(val):
-    """Convert string number to int or float."""
+    """Convert string to int or float, returning original if not numeric."""
     try:
         f = float(val)
         return int(f) if f == int(f) else f
@@ -260,23 +217,8 @@ def _coerce_numeric(val):
         return val
 
 def normalize_filters(filters):
-    """
-    Normalise LLM filter output to the format apply_filters() expects:
-      - operator dict:  {">=": 2}
-      - scalar:         "FN"  (equality)
-      - list:           ["FP", "FN"]  (membership)
-
-    Handles common LLM output variations:
-      ">0"          -> {">":  0}     (op+value fused into string)
-      "> 0"         -> {">":  0}     (op+value with space)
-      {"$gt": 0}    -> {">":  0}     (MongoDB-style operators)
-      {">": "2"}    -> {">":  2}     (numeric value as string)
-      0  (scalar)   -> {">" : 0}     (bare 0 for numeric range fields means > 0)
-
-    :param filters: raw filters dict from LLM
-    :return: normalised filters dict
-    """
-    # Numeric range fields — bare scalar 0 almost always means "> 0" in context
+    """Normalize LLM filter output to consistent operator dicts, scalars, or lists."""
+    # these fields treat scalar 0 as "> 0" (LLM shorthand)
     RANGE_FIELDS = {
         "num_cars", "num_pedestrians", "num_cyclists",
         "max_occlusion", "max_truncation",
@@ -284,68 +226,52 @@ def normalize_filters(filters):
     }
 
     normalised = {}
-
     for key, cond in filters.items():
-
-        #  list: keep as-is 
         if isinstance(cond, list):
+            # membership list: pass through unchanged
             normalised[key] = cond
-            continue
-
-        #  string: may be fused op+value e.g. ">0" or plain scalar 
-        if isinstance(cond, str):
+        elif isinstance(cond, str):
+            # fused operator string like ">=2": parse into {">=": 2}
             m = _OP_STRING_RE.match(cond.strip())
-            if m:
-                op, val = m.group(1), _coerce_numeric(m.group(2))
-                normalised[key] = {op: val}
-            else:
-                normalised[key] = cond   # plain string equality (e.g. "FN")
-            continue
-
-        #  numeric scalar 
-        if isinstance(cond, (int, float)):
-            if key in RANGE_FIELDS and cond == 0:
-                # "occlusion_level: 0" from LLM almost always means > 0
-                normalised[key] = {">": 0}
-            else:
-                normalised[key] = cond   # genuine equality (e.g. num_cars: 3)
-            continue
-
-        # dict: operator dict
-        if isinstance(cond, dict):
-            clean = {}
-            for op, val in cond.items():
-                # remap MongoDB operators
-                op = _MONGO_OPS.get(op, op)
-                # coerce string numeric values
-                val = _coerce_numeric(val) if isinstance(val, str) else val
-                clean[op] = val
-            normalised[key] = clean
-            continue
-
-        # fallback: keep unchanged
-        normalised[key] = cond
-
+            normalised[key] = {m.group(1): _coerce_numeric(m.group(2))} if m else cond
+        elif isinstance(cond, (int, float)):
+            # bare 0 on a range field means "> 0" in context
+            normalised[key] = {">": 0} if (key in RANGE_FIELDS and cond == 0) else cond
+        elif isinstance(cond, dict):
+            # translate $mongo operators and coerce string values to numbers
+            normalised[key] = {
+                _MONGO_OPS.get(op, op): (_coerce_numeric(val) if isinstance(val, str) else val)
+                for op, val in cond.items()
+            }
+        else:
+            # unknown type: pass through and let apply_filters handle it
+            normalised[key] = cond
     return normalised
 
 # ---------------------------------------------------------
-# LLM INTERPRETER (Ollama Llama3 - Scene + Error Mode)
+# LLM INTERPRETER (Scene + Error Mode) 
 # ---------------------------------------------------------
-# improvise prompt to handle false negative(s) cars(for cars) with occlusion ( 0)
 def interpret_query_with_llm(query, mode, llm_config):
-    """
-    Convert the user query into a filter dict + semantic query string
-    by asking the LLM. Routes to Ollama or Groq based on llm_config.
-
-    :param query: user query string from streamlit
-    :param mode: effective mode ('Scene Search' or 'Error Analysis')
-    :param llm_config: dict with keys 'provider', 'model', 'api_key'
-    """
+    """Send query to LLM and return (parsed filters + semantic query, latency_ms)."""
+    
+    # if query consist of fuzzy words
     fuzzy_hits = expand_fuzzy_terms(query)
 
-    fuzzy_instructions = ""
-    for term in fuzzy_hits:
-        fuzzy_instructions += f'"{term}" -> {json.dumps(FUZZY_RULES[term]["filters"])}\n'
+    if is_fuzzy_only(query, fuzzy_hits):
+        # all meaningful tokens covered by fuzzy rules — skip LLM entirely
+        merged_filters = {}
+        for term in fuzzy_hits:
+            merged_filters.update(FUZZY_RULES[term].get("filters", {}))
+        # return by skipping llm query
+        return {
+            "filters":        merged_filters,
+            "semantic_query": query,
+            "_source":        "fuzzy_only",
+        }, None
+
+    fuzzy_instructions = "".join(
+        f'"{t}" -> {json.dumps(FUZZY_RULES[t]["filters"])}\n' for t in fuzzy_hits
+    )
 
     prompt = f"""
 You are a query interpreter for a KITTI dataset explorer.
@@ -408,9 +334,10 @@ Return ONLY the JSON object. No explanation, no markdown, no code fences.
 
         parsed = extract_json_block(raw)
         if parsed is None:
+            # LLM returned unparseable output; treat as empty filters
             raise ValueError("No JSON found")
 
-        # Normalise operator formats before returning (handles LLM drift)
+        # normalize operator formats to handle LLM output drift
         if "filters" in parsed and isinstance(parsed["filters"], dict):
             parsed["filters"] = normalize_filters(parsed["filters"])
 
@@ -425,112 +352,117 @@ Return ONLY the JSON object. No explanation, no markdown, no code fences.
 
 
 # ---------------------------------------------------------
-# LOAD RAG COMPONENTS
+# Load TEXT RAG COMPONENTS: Load files relevant for text based querying
 # ---------------------------------------------------------
 @st.cache_resource
-def load_rag():
-    """
-    load RAG components (labels file doc, faiss index, transformer embedded model)
-    """
-    # load for the input dataset
+def load_rag_text():
+    """Load scene docs, error docs, and sentence-transformer model. Cached once."""
     with open("../data/kitti_docs.json", "r") as f:
         scene_docs = json.load(f)
     scene_index = faiss.read_index("../data/kitti_index.faiss")
 
-    # load the prediction errors
     with open("../data/error_docs.json", "r") as f:
         error_docs = json.load(f)
     error_index = faiss.read_index("../data/error_index.faiss")
 
-    # load model name
     with open("../data/embedding_model.txt", "r") as f:
         model_name = f.read().strip()
-
     model = SentenceTransformer(model_name)
 
-    # CLIP image index (optional — skip if not yet built)
-    clip_index, clip_frame_ids, clip_model = None, [], None
-    if os.path.exists("../data/clip_index.faiss"):
-        clip_index = faiss.read_index("../data/clip_index.faiss")
-        with open("../data/clip_frame_ids.json", "r") as f:
-            clip_frame_ids = json.load(f)
-        clip_model = SentenceTransformer("clip-ViT-B-32")
+    return scene_docs, scene_index, error_docs, error_index, model
 
-    return scene_docs, scene_index, error_docs, error_index, model, \
-           clip_index, clip_frame_ids, clip_model
-
-
-scene_docs, scene_index, error_docs, error_index, emb_model, \
-    clip_index, clip_frame_ids, clip_model = load_rag()
-
-# Build mode example embeddings once at startup (reuses already-loaded emb_model)
+# load text indexes and build mode embeddings once at startup
+scene_docs, scene_index, error_docs, error_index, emb_model = load_rag_text()
 mode_embeddings = build_mode_embeddings(emb_model)
 
 # ---------------------------------------------------------
-# FILTER ENGINE (supports dict, list, scalar)
+# FILTER ENGINE
 # ---------------------------------------------------------
 def apply_filters(docs, filters):
+    """Filter docs by operator dicts, scalars, or membership lists."""
     results = []
-
     for d in docs:
         ok = True
-
         for key, cond in filters.items():
-
-            # 1) List -> equality set
             if isinstance(cond, list):
+                # membership check: field value must be in the allowed list
                 if d.get(key) not in cond:
-                    ok = False
-                    break
+                    ok = False; break
                 continue
-
-            # 2) Scalar -> equality
             if not isinstance(cond, dict):
+                # exact match for scalar condition
                 if d.get(key) != cond:
-                    ok = False
-                    break
+                    ok = False; break
                 continue
-
-            # 3) Operator dict
             for op, val in cond.items():
                 dv = d.get(key)
-
                 if dv is None:
-                    ok = False
-                    break
-
+                    # missing field always fails the filter
+                    ok = False; break
                 if op == ">=" and not (dv >= val): ok = False
                 if op == "<=" and not (dv <= val): ok = False
                 if op == ">"  and not (dv >  val): ok = False
                 if op == "<"  and not (dv <  val): ok = False
                 if op == "==" and not (dv == val): ok = False
-
             if not ok:
                 break
-
         if ok:
             results.append(d)
-
     return results
 
-
 # ---------------------------------------------------------
-# SEMANTIC SEARCH
+# FALLBACK SEMANTIC SEARCH
 # ---------------------------------------------------------
 def semantic_search(query, docs, index, embed_model, top_k=10):
+    """Encode query and return top_k docs by L2 distance in FAISS index."""
     emb = embed_model.encode([query], convert_to_numpy=True).astype("float32")
     D, I = index.search(emb, top_k)
     return [docs[i] for i in I[0]]
 
 
 # ---------------------------------------------------------
+# Load CLIP RAG COMPONENTS: files relevant for CLIP based querying
+# ---------------------------------------------------------
+# CLIP model configs: label shown in sidebar -> index filenames and model id
+CLIP_MODEL_CONFIGS = {
+    "ViT-B-32  (512-dim, fast)": {
+        "model_id":   "clip-ViT-B-32",
+        "index_path": "../data/clip_index_B32.faiss",
+        "ids_path":   "../data/clip_frame_ids_B32.json",
+    },
+    "ViT-L-14  (768-dim, better)": {
+        "model_id":          "clip-ViT-L-14",
+        "index_path":        "../data/clip_index_14.faiss",
+        "ids_path":          "../data/clip_frame_ids_14.json", 
+    },
+}
+
+@st.cache_resource
+def load_rag_clip(clip_model_label: str):
+    """Load CLIP index and model for given label. Cached per model so switching is instant at runtim."""
+    cfg = CLIP_MODEL_CONFIGS[clip_model_label]
+    index_path = cfg["index_path"]
+    ids_path   = cfg["ids_path"]
+
+    if not os.path.exists(index_path):
+        # model-specific not found
+        return None, [], None
+
+    clip_index     = faiss.read_index(index_path)
+    with open(ids_path, "r") as f:
+        clip_frame_ids = json.load(f)
+    clip_model = SentenceTransformer(cfg["model_id"])
+
+    print(f"CLIP loaded: {cfg['model_id']}  dim={clip_index.d}  frames={len(clip_frame_ids)}")
+    return clip_index, clip_frame_ids, clip_model
+
+
+# ---------------------------------------------------------
 # CLIP VISUAL SEARCH
 # ---------------------------------------------------------
-def clip_encode_images(pil_images, model):
-    """
-    Encode a list of PIL images with CLIP and return the mean
-    L2-normalised embedding (support-set average).
-    """
+# get image query embedding
+def get_embedding_images_query(pil_images, model):
+    """Encode list of PIL images with CLIP and return mean L2-normalised embedding."""
     embs = []
     for img in pil_images:
         e = model.encode(img, convert_to_numpy=True).astype("float32")
@@ -539,39 +471,26 @@ def clip_encode_images(pil_images, model):
             e /= norm
         embs.append(e)
     mean_emb = np.mean(embs, axis=0).astype("float32")
-    mean_emb /= np.linalg.norm(mean_emb)          # renormalise after mean
+    mean_emb /= np.linalg.norm(mean_emb)
     return mean_emb
 
-
-def clip_encode_text(text, model):
-    """
-    Encode a text string with CLIP text encoder, L2-normalised.
-    """
+# get text query embedding
+def get_clip_encode_text(text, model):
+    """Encode text string with CLIP and return L2-normalised embedding."""
     e = model.encode(text, convert_to_numpy=True).astype("float32")
     e /= np.linalg.norm(e)
     return e
 
-
+# search based query embedding(text/image) over CLIP docs
 def clip_search(query_emb, clip_index, clip_frame_ids, scene_docs, top_k=10):
-    """
-    Search the CLIP image index and return matching scene docs with scores.
-
-    :param query_emb: normalised 512-dim query vector (text or image)
-    :param clip_index: IndexFlatIP
-    :param clip_frame_ids: ordered list matching index positions
-    :param scene_docs: list of scene doc dicts (for image_path lookup)
-    :param top_k: number of results
-    :return: list of (score, frame_id, image_path)
-    """
+    """Search CLIP image index and return top_k results with score and image path."""
     q = query_emb.reshape(1, -1)
     scores, indices = clip_index.search(q, top_k)
-
-    # Build a quick lookup from frame_id -> image_path
     id_to_doc = {d["id"]: d for d in scene_docs}
-
     results = []
     for score, idx in zip(scores[0], indices[0]):
         if idx < 0:
+            # FAISS returns -1 for empty slots when index has fewer vectors than top_k
             continue
         fid = clip_frame_ids[idx]
         doc = id_to_doc.get(fid, {})
@@ -584,321 +503,336 @@ def clip_search(query_emb, clip_index, clip_frame_ids, scene_docs, top_k=10):
     return results
 
 # ------------------------------------------------------------
-# VISUALIZATION HELPERS
+# VISUALIZATION HELPERS for text based querying
 # ------------------------------------------------------------
 def draw_boxes(img, boxes, color, label_prefix):
-    """
-    Docstring for draw_boxes
-    
-    :param img: Description
-    :param boxes: Description
-    :param color: Description
-    :param label_prefix: Description
-    """
-    VALID_CLASSES = {"Car", "Pedestrian", "Cyclist"} 
-    for b in boxes: 
-        cls = b["class"] 
-        # Only draw GT boxes for Car / Pedestrian / Cyclist 
-        if cls not in VALID_CLASSES: 
+    """Draw bounding boxes for Car, Pedestrian, Cyclist classes only. -> image with bbox"""
+    VALID_CLASSES = {"Car", "Pedestrian", "Cyclist"}
+    for b in boxes:
+        cls = b["class"]
+        if cls not in VALID_CLASSES:
+            # skip DontCare, Misc, and other KITTI labels not relevant for display
             continue
         x1, y1, x2, y2 = map(int, b["bbox"])
-        label = f"{label_prefix} {cls}"
-        # if "confidence" in b and b["confidence"] is not None:
-        #     label += f" conf {b['confidence']:.2f}"
-        # if "occlusion_level" in b and b["occlusion_level"] is not None:
-        #     label += f" occ {b['occlusion_level']}"
-        # if "truncation_value" in b and b["truncation_value"] is not None:
-        #     label += f" trunc {b['truncation_value']:.2f}"
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(img, label, (x1, y1 - 8),
+        # FP/FN label text
+        cv2.putText(img, f"{label_prefix} {cls}", (x1, y1 - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     return img
 
+def parse_kitti_label_file(path):
+    """Parse a KITTI label .txt file -> list of object dicts."""
+    if not os.path.exists(path):
+        return []
+    objs = []
+    with open(path) as f:
+        for line in f:
+            parts = line.strip().split()
+            objs.append({
+                "type": parts[0],
+                "truncated": float(parts[1]),
+                "occluded": int(parts[2]),
+                "alpha": float(parts[3]),
+                "bbox": list(map(float, parts[4:8])),
+                "dimensions": list(map(float, parts[8:11])),
+                "location": list(map(float, parts[11:14])),
+                "rotation_y": float(parts[14])
+            })
+    return objs
 
 def render_side_by_side(frame_id, image_path, frame_errors):
-    """
-    Docstring for render_side_by_side
-    
-    :param frame_id: Description
-    :param image_path: Description
-    :param frame_errors: Description
-    """
-
+    """Render image with boxes GT (green) and prediction (yellow) side by side with FP/FN highlights."""
     img = cv2.imread(image_path)
     if img is None:
         return None
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    gt_path = os.path.join("../data/training/label_2", f"{frame_id}.txt")
+    gt_path   = os.path.join("../data/training/label_2", f"{frame_id}.txt")
     pred_path = os.path.join("../runs/detect/predict/kitti_labels", f"{frame_id}.txt")
 
-    gt_objs = parse_kitti_label_file(gt_path)
+    gt_objs   = parse_kitti_label_file(gt_path)
     pred_objs = parse_kitti_label_file(pred_path)
 
-    gt_img = img.copy()
+    # copy image and draw boxes
+    gt_img   = img.copy()
     pred_img = img.copy()
 
-    # draw GT boxes on left in green color
-    gt_boxes = [{
-        "bbox": o["bbox"],
-        "class": o["type"],
-        "occlusion_level": o["occluded"],
-        "truncation_value": o["truncated"]
-    } for o in gt_objs]
+    # draw GT boxes
+    gt_boxes = [{"bbox": o["bbox"], "class": o["type"],
+                 "occlusion_level": o["occluded"], "truncation_value": o["truncated"]}
+                for o in gt_objs]
     gt_img = draw_boxes(gt_img, gt_boxes, (0, 255, 0), "GT")
 
-    # draw GT boxes on left in yellow color
-    pred_boxes = [{
-        "bbox": o["bbox"],
-        "class": o["type"]
-    } for o in pred_objs]
+    # draw Pred boxes
+    pred_boxes = [{"bbox": o["bbox"], "class": o["type"]} for o in pred_objs]
     pred_img = draw_boxes(pred_img, pred_boxes, (255, 255, 0), "Pred")
 
+    # highlight error frames
     for e in frame_errors:
         if "bbox" not in e:
             continue
-        # FP as red color
+        # FP in red, FN in blue
         if e["error_type"] == "FP":
             pred_img = draw_boxes(pred_img, [e], (255, 0, 0), "FP")
         else:
-            # FN as blue color
             gt_img = draw_boxes(gt_img, [e], (0, 128, 255), "FN")
-
-    combined = np.hstack([gt_img, pred_img])
-    return combined
+    # combined image side by side
+    return np.hstack([gt_img, pred_img])
 
 
 # ---------------------------------------------------------
-# STREAMLIT UI
+# MAIN STREAMLIT UI
 # ---------------------------------------------------------
 st.title("KITTI RAG Explorer (Scene Search + Error Analysis)")
 st.write("Ask natural language questions about KITTI scenes, objects, occlusion, truncation, or counts.")
 st.write("Color code: FP = red, FN = blue")
 
-# ---------------------------------------------------------
-# SIDEBAR — LLM Provider
-# ---------------------------------------------------------
+# sidebar LLM provider config
 st.sidebar.markdown("## LLM Provider")
 llm_provider = st.sidebar.radio("Backend", ["Ollama (local)", "Groq (cloud)"])
 
 if llm_provider == "Ollama (local)":
+    # configure local Ollama with model selection
     ollama_model = st.sidebar.selectbox("Ollama Model", ["llama3", "llama3.1", "mistral"])
-    st.sidebar.caption(f"Running locally via Ollama — model: {ollama_model}")
+    st.sidebar.caption(f"Running locally via Ollama model: {ollama_model}")
     llm_config = {"provider": "Ollama", "model": ollama_model, "api_key": ""}
 else:
+    # configure Groq cloud selection
     if not GROQ_AVAILABLE:
-        st.sidebar.error("groq package not installed -> pip install groq")
+        # groq package missing
+        st.sidebar.error("groq package not installed")
     groq_model = st.sidebar.selectbox(
-        "Groq Model",
-        ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        "Groq Model", ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
     )
-    groq_key = st.sidebar.text_input("Groq API Key", type="password")
-    st.sidebar.caption(f"Groq cloud — model: {groq_model}")
+    groq_key = st.sidebar.text_input("Groq API Key", type="password") # api key
+    st.sidebar.caption(f"Groq cloud model: {groq_model}")
     llm_config = {"provider": "Groq", "model": groq_model, "api_key": groq_key}
 
 st.sidebar.divider()
 
 # ---------------------------------------------------------
-# SIDEBAR — Mode Hint (can be overridden by auto-detection)
+# sidebar CLIP model selector -> queries (txt -> image or image to image)
 # ---------------------------------------------------------
-st.sidebar.markdown("### Mode Hint")
-st.sidebar.caption(
-    "Auto-detection overrides this if error-related keywords "
-    "(missed, FP, FN, IoU ...) are found in your query."
+# (cached per model so switching is instant after first load)
+st.sidebar.markdown("### Visual Search Model")
+clip_model_label = st.sidebar.radio(
+    "CLIP model",
+    list(CLIP_MODEL_CONFIGS.keys()),
+    help="ViT-B-32 is faster. ViT-L-14 has finer-grained embeddings (needs separate index build)."
 )
-query_mode = st.sidebar.selectbox("Mode Hint", ["Scene Search", "Error Analysis"])
+clip_index, clip_frame_ids, clip_model = load_rag_clip(clip_model_label)
+
+if clip_index is not None:
+    # show model and index stats in sidebar
+    st.sidebar.caption(
+        f"Loaded: {CLIP_MODEL_CONFIGS[clip_model_label]['model_id']} "
+        f"| dim={clip_index.d} | {len(clip_frame_ids):,} frames"
+    )
+else:
+    # index missing: guide user to build it
+    st.sidebar.warning(
+        "Index not found. Build it with:\n"
+        f"`python generate_faiss_doc.py --clip-model "
+        f"{CLIP_MODEL_CONFIGS[clip_model_label]['model_id'].replace('clip-', '')} --skip-text`"
+    )
+
+st.sidebar.divider()
 
 # ---------------------------------------------------------
-# MAIN — Query input
+# Sidebar mode hint (auto-detection can override this)
 # ---------------------------------------------------------
+st.sidebar.markdown("### Mode Hint")
+st.sidebar.caption("Auto-detection overrides this if error keywords (FP, FN, IoU) are found.")
+query_mode = st.sidebar.selectbox("Mode Hint", ["Scene Search", "Error Analysis"])
+
+
+# ---------------------------------------------------------
+# Text Based Query (SCENE or ERROR mode)
+# ---------------------------------------------------------
+# main query input
 query = st.text_input("Enter your query")
 top_k = st.slider("Number of results", 1, 10, 5)
 
-
+# check if pre-selected mode is correct based on query
 if query:
-
-    # ---------------------------------------------------------
-    # AUTO MODE DETECTION (embedding-based)
-    # ---------------------------------------------------------
     effective_mode, was_overridden, scores = auto_detect_mode(
         query, query_mode, mode_embeddings, emb_model
     )
 
-    # print the mode 
     if was_overridden:
+        # auto-detect changed the mode -> show which hint was overridden
         st.info(
             f"Auto-detected mode: **{effective_mode}** "
             f"(overrode sidebar hint: '{query_mode}')  "
-            f"— scores: Error Analysis {scores['Error Analysis']:.3f} "
+            f"scores: Error Analysis {scores['Error Analysis']:.3f} "
             f"| Scene Search {scores['Scene Search']:.3f}"
         )
     else:
+        # mode matches the sidebar hint -> just confirm it
         st.info(
             f"Mode: **{effective_mode}**  "
-            f"— scores: Error Analysis {scores['Error Analysis']:.3f} "
+            f"scores: Error Analysis {scores['Error Analysis']:.3f} "
             f"| Scene Search {scores['Scene Search']:.3f}"
         )
 
-    # ---------------------------------------------------------
-    # LLM INTERPRETATION (query -> filters)
-    # ---------------------------------------------------------
+    # convert query -> json output format via LLM
     parsed, llm_latency_ms = interpret_query_with_llm(query, effective_mode, llm_config)
-    filters = parsed.get("filters", {})
+    query_filters        = parsed.get("filters", {})
     semantic_query = parsed.get("semantic_query", query)
 
     st.markdown("### LLM Interpretation")
-    if llm_latency_ms is not None:
+    if parsed.get("_source") == "fuzzy_only":
+        # all terms matched fuzzy rules — LLM was not called
+        st.caption("fuzzy rules only — LLM skipped (no latency)")
+    elif llm_latency_ms is not None:
+        # show latency badge when LLM was called successfully
         provider_label = llm_config.get("provider", "LLM")
         model_label    = llm_config.get("model", "")
         color = "green" if llm_latency_ms < 1000 else ("orange" if llm_latency_ms < 3000 else "red")
-        st.caption(
-            f"**{provider_label}** ({model_label}) — "
-            f":{color}[{llm_latency_ms:.0f} ms]"
-        )
-    st.json(parsed)
+        st.caption(f"**{provider_label}** ({model_label}) :{color}[{llm_latency_ms:.0f} ms]")
+    st.json({k: v for k, v in parsed.items() if k != "_source"})
 
-    # Select dataset based on effective mode
-    if effective_mode == "Scene Search":
-        docs = scene_docs
-        index = scene_index
-    else:
-        docs = error_docs
-        index = error_index
+    # pick relevant doc and index file
+    docs  = scene_docs  if effective_mode == "Scene Search" else error_docs
+    index = scene_index if effective_mode == "Scene Search" else error_index
 
-    # ---------------------------------------------------------
-    # APPLY NUMERIC FILTERS
-    # ---------------------------------------------------------
-    filtered_docs = apply_filters(docs, filters)
+    # search in docs based on filters
+    filtered_docs = apply_filters(docs, query_filters)
 
     if len(filtered_docs) > 0:
+        # filter matched -> display results ranked by the primary filter field
         st.success(f"Found {len(filtered_docs)} frames matching filters")
 
-        # Sort by the most relevant field 
+        # sort by the first range filter field found
         sort_field = None
-        for field, cond in filters.items():
+        for field, cond in query_filters.items():
             if isinstance(cond, list) or not isinstance(cond, dict):
-                sort_field = field
+                sort_field = field; 
                 break
             for op in cond.keys():
                 if op in [">", ">=", "<", "<="]:
-                    sort_field = field
+                    sort_field = field; 
                     break
             if sort_field:
                 break
-
+        # Sort to display results as top. ex: query as "more than 5 pedestrians" then display first result as frame with max pedestrians           
         if sort_field:
-            filtered_docs = sorted(
-                filtered_docs,
-                key=lambda d: d.get(sort_field, 0),
-                reverse=True
-            )
-
-
-        # display filtered result images
+            # sort descending so highest-value frames appear first
+            filtered_docs = sorted(filtered_docs, key=lambda d: d.get(sort_field, 0), reverse=True)
+        # display k results 
         for d in filtered_docs[:top_k]:
             st.subheader(f"Frame {d['id']}")
             st.write(d["summary_text"])
-            image_path = Path(*Path(d["image_path"]).parts[1:]) # Drop the leading ".."
-            # if print_debug:
-            #     print("\n image path:", image_path , " parent_dir", parent_dir)
-            img_path = parent_dir / image_path
+            img_path = parent_dir / Path(*Path(d["image_path"]).parts[1:])
             if effective_mode == "Error Analysis":
-                st.write(f"**Error Type:** {d['error_type']}")
-                st.write(f"**Class:** {d['class']}")
-                st.write(f"**IoU:** {d['iou']}")
-
+                # show error metadata and GT vs prediction side-by-side overlay
+                st.write(f"**Error Type:** {d['error_type']}  **Class:** {d['class']}  **IoU:** {d['iou']:.3f}")
                 frame_errors = [e for e in error_docs if e["id"] == d["id"]]
-
-                combined = render_side_by_side(d["id"], img_path, frame_errors)
-                if combined is not None:
-                    st.image(combined, caption="GT (left) vs Predictions (right)")
-                else:
-                    st.image(img_path)
+                # get rendered image with GT and Predictions side by side
+                combined_img = render_side_by_side(d["id"], img_path, frame_errors)
+                st.image(combined_img if combined_img is not None else img_path,
+                         caption="GT (left) vs Predictions (right)")
             else:
+                # scene search -> just show the raw image
                 st.image(img_path)
         st.stop()
 
-    if filters:
-        st.warning("No matches for filters. Falling back to semantic search.")
+    if query_filters:
+        # filters present but no docs matched -> notify and fall back to embedding search
+        st.warning("No matches for query_filters. Falling back to semantic search.")
 
-    # ---------------------------------------------------------
-    # SEMANTIC SEARCH
-    # ---------------------------------------------------------
     results = semantic_search(semantic_query, docs, index, emb_model, top_k)
-
     st.markdown("### Semantic Search Results")
 
     for d in results:
         st.subheader(f"Frame {d['id']}")
         st.write(d["summary_text"])
-        image_path = Path(*Path(d["image_path"]).parts[1:]) # Drop the leading ".."
-        img_path = parent_dir / image_path
-        
+        img_path = parent_dir / Path(*Path(d["image_path"]).parts[1:])
         if effective_mode == "Error Analysis":
-            st.write(f"**Error Type:** {d['error_type']}")
-            st.write(f"**Class:** {d['class']}")
-            st.write(f"**IoU:** {d['iou']}")
+            # overlay FP/FN annotations on GT vs prediction comparison
+            st.write(f"**Error Type:** {d['error_type']}  **Class:** {d['class']}  **IoU:** {d['iou']:.3f}")
             frame_errors = [e for e in error_docs if e["id"] == d["id"]]
-
-            # show GT and predicted images
-            combined = render_side_by_side(d["id"], img_path, frame_errors)
-            if combined is not None:
-                st.image(combined, caption="GT (left) vs Predictions (right)")
-            else:
-                st.image(img_path)
-        # for scene search - show the image directly
+            combined_img = render_side_by_side(d["id"], img_path, frame_errors)
+            st.image(combined_img if combined_img is not None else img_path,
+                     caption="GT (left) vs Predictions (right)")
+        # scene mode -> just show the raw image
         st.image(img_path)
 
-
 # ---------------------------------------------------------
-# VISUAL SEARCH (CLIP) — separate section below text query
+# CLIP VISUAL SEARCH (modes: text -> image or image -> image)
 # ---------------------------------------------------------
 st.divider()
 st.markdown("## Visual Search (CLIP)")
 
 if clip_index is None:
-    st.warning(
-        "CLIP index not found. Run `generate_faiss_doc.py` to build it first.  \n"
-        "`python queries/generate_faiss_doc.py`"
-    )
+    # CLIP index missing: prompt user to run the builder script
+    st.warning("CLIP index not found. Run `python queries/generate_faiss_doc.py` to build it.")
 else:
-    clip_search_mode = st.radio(
-        "Query type",
-        ["Text -> Images", "Image -> Images"],
-        horizontal=True
-    )
+    # CLIP index ready: show visual search UI
+    clip_search_mode = st.radio("Query type", ["Text2Images", "Image2Images"], horizontal=True)
     clip_top_k = st.slider("Visual results", 1, 10, 5, key="clip_k")
 
-    # Text -> Images 
-    # works with full frame level context only but not minor object like - pedestrian crossing sign or . 
-    if clip_search_mode == "Text -> Images":
+    # text -> image 
+    if clip_search_mode == "Text2Images":
+        # text query: optionally expand with Groq, then encode with CLIP
         clip_text_query = st.text_input(
-            "Describe what you want to find visually -- full frame level context only",
-            placeholder="e.g. traffic light, parked vehicles, frames with railway tracks, road with tram line",
+            "Describe what you want to find visually",
+            placeholder="e.g. pedestrian crossing sign, construction worker, road with tram tracks",
             key="clip_text"
         )
-        # run query, calculate latency and display top k results
-        if clip_text_query:
-            t0 = time.perf_counter()
-            q_emb = clip_encode_text(clip_text_query, clip_model)
-            latency_ms = (time.perf_counter() - t0) * 1000
-            results = clip_search(q_emb, clip_index, clip_frame_ids, scene_docs, clip_top_k)
-            st.caption(f" CLIP text encode + search — {latency_ms:.0f} ms")
 
+        # query expansion: Provided text query is passed to llm to improvise the query before passing to CLIP encoding
+        if clip_text_query:
+            # run search when user has entered a query
+            groq_available = (
+                llm_config.get("provider") == "Groq"
+                and llm_config.get("api_key", "").strip()
+            )
+
+            if groq_available:
+                # expand short query to rich visual description before CLIP encoding
+                expand_prompt = f"""You are helping improve image search using CLIP embeddings.
+Expand the following short query into a detailed visual description (2-3 sentences).
+Focus on: colors, shapes, textures, positions, visual appearance, surrounding context.
+Do NOT add information that isn't implied by the query.
+Do NOT include any explanation — output only the expanded description.
+
+Query: "{clip_text_query}"
+"""
+                try:
+                    # query expansion and measure latency
+                    t_expand = time.perf_counter()
+                    expanded_query = call_llm(expand_prompt, llm_config)
+                    expand_ms = (time.perf_counter() - t_expand) * 1000
+                    st.caption(f"Expanded query ({expand_ms:.0f} ms): *{expanded_query}*")
+                except Exception as e:
+                    # expansion failed: fall back to raw query silently
+                    expanded_query = clip_text_query
+                    st.caption(f"Query expansion failed ({e}), using original.")
+            else:
+                # Groq not active: skip expansion and use raw query
+                expanded_query = clip_text_query
+                st.info("Select Groq in the sidebar to enable query expansion for better results.")
+
+            # run query, measure latency and display top k results
+            t0 = time.perf_counter()
+            q_emb      = get_clip_encode_text(expanded_query, clip_model)
+            latency_ms = (time.perf_counter() - t0) * 1000
+            results    = clip_search(q_emb, clip_index, clip_frame_ids, scene_docs, clip_top_k)
+            # latency display
+            color = "green" if latency_ms < 500 else ("orange" if latency_ms < 2000 else "red")
+            st.caption(f"CLIP encode + search :{color}[{latency_ms:.0f} ms]")
+            # display results
             st.markdown(f"**Top {clip_top_k} visually similar frames:**")
             for r in results:
-                image_path = Path(*Path(r["image_path"]).parts[1:]) # Drop the leading ".."
-                img_path = parent_dir / image_path
-                st.subheader(f"Frame {r['frame_id']}  —  score {r['score']:.3f}")
+                img_path = parent_dir / Path(*Path(r["image_path"]).parts[1:])
+                st.subheader(f"Frame {r['frame_id']}  score {r['score']:.3f}")
                 st.caption(r["summary_text"])
                 st.image(img_path)
 
-    #  Image -> Images 
+    # Image -> image query (uploaded image/s is encoded and search by visual similarity)
     else:
-        st.caption(
-            "Upload 1-5 example images (support set). "
-            "Multiple images make the query more robust "
-        )
+        st.caption("Upload 1-5 example images. Multiple images make the query more robust.")
         uploaded_files = st.file_uploader(
             "Upload query image(s)",
             type=["png", "jpg", "jpeg"],
@@ -906,24 +840,26 @@ else:
             key="clip_upload"
         )
         if uploaded_files:
+            # encode uploaded images and run similarity search
             pil_images = [Image.open(f).convert("RGB") for f in uploaded_files]
 
-            # Show thumbnails of uploaded support set
+            # show uploaded image thumbnails
             cols = st.columns(min(len(pil_images), 5))
             for col, img in zip(cols, pil_images):
-                col.image(img, use_container_width=True)
+                col.image(img, width='stretch') # use_container_width=True
 
             # run query, measure latency and display top k results
             t0 = time.perf_counter()
-            q_emb = clip_encode_images(pil_images, clip_model)
+            q_emb      = get_embedding_images_query(pil_images, clip_model)
             latency_ms = (time.perf_counter() - t0) * 1000
-            results = clip_search(q_emb, clip_index, clip_frame_ids, scene_docs, clip_top_k)
-            st.caption(f" CLIP image encode ({len(pil_images)} image(s)) + search — {latency_ms:.0f} ms")
-            
+            results    = clip_search(q_emb, clip_index, clip_frame_ids, scene_docs, clip_top_k)
+            # latency display
+            color = "green" if latency_ms < 500 else ("orange" if latency_ms < 2000 else "red")
+            st.caption(f"CLIP image encode ({len(pil_images)} image(s)) + search: {color}[{latency_ms:.0f} ms]") 
+            # display results 
             st.markdown(f"**Top {clip_top_k} visually similar frames:**")
             for r in results:
-                image_path = Path(*Path(r["image_path"]).parts[1:]) # Drop the leading ".."
-                img_path = parent_dir / image_path
-                st.subheader(f"Frame {r['frame_id']}  —  score {r['score']:.3f}")
+                img_path = parent_dir / Path(*Path(r["image_path"]).parts[1:])
+                st.subheader(f"Frame {r['frame_id']}  score {r['score']:.3f}")
                 st.caption(r["summary_text"])
                 st.image(img_path)
